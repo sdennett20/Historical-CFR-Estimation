@@ -1,3 +1,5 @@
+# I believe this file does not work! Use run_cfr.py and cfr_exact.py
+
 # Create functions to calculate CFR given correct input data
 # load libraries
 import pandas as pd
@@ -9,12 +11,13 @@ from scipy.stats import gamma as gamma_dist
 try:
     from rpy2.robjects.packages import importr
     from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
     import rpy2.robjects as ro
 
-    pandas2ri.activate()
 except ImportError:
     importr = None
     pandas2ri = None
+    localconverter = None
     ro = None
 
 if importr is not None:
@@ -24,19 +27,8 @@ if importr is not None:
         cfr = None
         print(f"Error importing cfr package: {e}")
         print("Please install cfr in R with: install.packages('cfr')")
-
-    try:
-        flexsurvcure = importr('flexsurvcure')
-        survival = importr('survival')
-    except Exception as e:
-        flexsurvcure = None
-        survival = None
-        print(f"Error importing flexsurvcure package: {e}")
-        print("Please install flexsurvcure in R with: install.packages('flexsurvcure')")
 else:
     cfr = None
-    flexsurvcure = None
-    survival = None
 
 # Naive
 def naive_1(deaths, cases):
@@ -84,29 +76,41 @@ def delay_adjusted_3(data,
     Returns:
     - CFR estimate with confidence intervals from R cfr package
     """
-    if pandas2ri is None or ro is None or cfr is None:
+    if pandas2ri is None or ro is None or cfr is None or localconverter is None:
         print("Error calculating Nishiura cCFR: rpy2/cfr is not available in this Python environment")
         return None
 
-    # Convert pandas DataFrame to R DataFrame
-    r_data = pandas2ri.py2rpy(data)
-    
+    # cfr::cfr_static requires an R Date column (date-only), not POSIXct
+    # (datetime-with-time) and not a raw numeric. pandas2ri does not reliably
+    # preserve R's `Date` class when converting Python datetime64/date values
+    # (it can silently fall back to a plain numeric on the R side), so we
+    # sidestep the ambiguity entirely: send the date as an ISO string and let
+    # R's own as.Date() do the conversion explicitly.
+    data = data.copy()
+    data["date"] = pd.to_datetime(data["date"]).dt.strftime("%Y-%m-%d")
+
     # Call R cfr package's cfr_static function
     try:
-        # Create R function call to cfr::cfr_static with delay_density
-        r_code = f"""
-        library(cfr)
-        cfr_result <- cfr_static(
-            data = data,
-            delay_density = function(x) dgamma(x, shape = {delay_shape}, scale = {delay_scale})
-        )
-        cfr_result
-        """
-        
-        # Execute R code
-        ro.r(f'data <- data')
-        result = ro.r(r_code)
-        return result
+        with localconverter(ro.default_converter + pandas2ri.converter):
+            # Convert pandas DataFrame to R DataFrame
+            r_data = ro.conversion.py2rpy(data)
+
+            # Make the converted R dataframe available to the R code below
+            ro.globalenv['data'] = r_data
+
+            # Create R function call to cfr::cfr_static with delay_density
+            r_code = f"""
+            library(cfr)
+            data$date <- as.Date(data$date, format = "%Y-%m-%d")
+            cfr_result <- cfr_static(
+                data = data,
+                delay_density = function(x) dgamma(x, shape = {delay_shape}, scale = {delay_scale})
+            )
+            cfr_result
+            """
+
+            result = ro.r(r_code)
+            return result
     except Exception as e:
         print(f"Error calculating Nishiura cCFR: {e}")
         return None
@@ -1000,5 +1004,3 @@ def run_all_cfr_examples(data_dir="Data"):
 
 if __name__ == "__main__":
     run_all_cfr_examples()
-
-
