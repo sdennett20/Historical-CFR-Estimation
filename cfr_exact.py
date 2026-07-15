@@ -18,6 +18,8 @@ Supported estimator families:
 
 The point-estimate formulas are implemented directly from the published
 descriptions and the Epiverse reference implementation docs.
+
+Note that this code is made with AI and has not been checked yet. 
 """
 
 from __future__ import annotations
