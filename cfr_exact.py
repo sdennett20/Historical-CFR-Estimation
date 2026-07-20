@@ -37,7 +37,6 @@ from scipy.optimize import minimize
 from scipy.special import expit
 from scipy import stats
 
-
 # ---------------------------------------------------------------------------
 # Generic utilities
 # ---------------------------------------------------------------------------
@@ -106,6 +105,51 @@ def _make_discrete_pmf_from_delays(delays: np.ndarray) -> Dict[str, Any]:
         "median": float(np.median(delays)),
         "n": int(delays.size),
     }
+
+def fit_parametric_delay_distribution(delays, family="gamma"):
+    x = pd.Series(delays).astype(float)
+    x = x[np.isfinite(x) & (x >= 0)].to_numpy()
+    if x.size == 0:
+        raise ValueError("No valid non-negative delays available.")
+
+    # avoid exact zeros for some scipy fits
+    x = np.maximum(x, 1e-8)
+    family = family.lower()
+
+    if family == "gamma":
+        shape, loc, scale = stats.gamma.fit(x, floc=0)
+        return {
+            "family": "gamma",
+            "shape": float(shape),
+            "loc": float(loc),
+            "scale": float(scale),
+            "cdf": lambda ages: stats.gamma.cdf(np.asarray(ages, dtype=float), a=shape, loc=0, scale=scale),
+            "n": int(x.size),
+        }
+
+    if family == "weibull":
+        shape, loc, scale = stats.weibull_min.fit(x, floc=0)
+        return {
+            "family": "weibull",
+            "shape": float(shape),
+            "loc": float(loc),
+            "scale": float(scale),
+            "cdf": lambda ages: stats.weibull_min.cdf(np.asarray(ages, dtype=float), c=shape, loc=0, scale=scale),
+            "n": int(x.size),
+        }
+
+    if family == "lognormal":
+        sigma, loc, scale = stats.lognorm.fit(x, floc=0)
+        return {
+            "family": "lognormal",
+            "sigma": float(sigma),
+            "loc": float(loc),
+            "scale": float(scale),
+            "cdf": lambda ages: stats.lognorm.cdf(np.asarray(ages, dtype=float), s=sigma, loc=0, scale=scale),
+            "n": int(x.size),
+        }
+
+    raise ValueError("family must be one of {'gamma', 'weibull', 'lognormal'}")
 
 
 def _delay_cdf_at_ages(delay_distribution: Any, ages: np.ndarray) -> np.ndarray:
@@ -453,6 +497,26 @@ def standardize_line_list(
 # Delay distributions from individual-level data
 # ---------------------------------------------------------------------------
 
+
+
+
+
+def estimate_delay_distribution_from_dates(
+    onset_dates: Sequence[Any],
+    outcome_dates: Sequence[Any],
+    *,
+    dayfirst: bool = True,
+    family: str = "gamma",
+) -> Dict[str, Any]:
+    onset = pd.to_datetime(pd.Series(list(onset_dates)), errors="coerce", dayfirst=dayfirst)
+    outcome = pd.to_datetime(pd.Series(list(outcome_dates)), errors="coerce", dayfirst=dayfirst)
+
+    delays = (outcome - onset).dt.days.to_numpy()
+    delays = delays[np.isfinite(delays) & (delays >= 0)]
+
+    return fit_parametric_delay_distribution(delays, family=family)
+
+
 def estimate_delay_distributions_from_individual_data(
     df: pd.DataFrame,
     *,
@@ -462,9 +526,11 @@ def estimate_delay_distributions_from_individual_data(
     death_label: str = "death",
     recovery_label: str = "recovery",
     dayfirst: bool = True,
+    family: str = "gamma",
 ) -> Dict[str, Dict[str, Any]]:
-    """Estimate discrete empirical delay distributions for death and recovery."""
+    """Estimate parametric delay distributions for death and recovery."""
     _require_columns(df, [onset_col, outcome_date_col, outcome_col])
+
     work = df[[onset_col, outcome_date_col, outcome_col]].copy()
     work[onset_col] = _to_datetime(work[onset_col], dayfirst=dayfirst)
     work[outcome_date_col] = _to_datetime(work[outcome_date_col], dayfirst=dayfirst)
@@ -475,28 +541,18 @@ def estimate_delay_distributions_from_individual_data(
         sub = work.loc[work[outcome_col].eq(label)].dropna(subset=[onset_col, outcome_date_col]).copy()
         if sub.empty:
             continue
-        delays = (sub[outcome_date_col] - sub[onset_col]).dt.days.to_numpy()
-        delays = delays[np.isfinite(delays) & (delays >= 0)]
-        if delays.size == 0:
-            continue
-        out[label] = _make_discrete_pmf_from_delays(delays)
+
+        out[label] = estimate_delay_distribution_from_dates(
+            sub[onset_col],
+            sub[outcome_date_col],
+            dayfirst=dayfirst,
+            family=family,
+        )
 
     if not out:
         raise ValueError("No valid delays found to estimate any distribution.")
+
     return out
-
-
-def estimate_delay_distribution_from_dates(
-    onset_dates: Sequence[Any],
-    outcome_dates: Sequence[Any],
-    *,
-    dayfirst: bool = True,
-) -> Dict[str, Any]:
-    onset = pd.to_datetime(pd.Series(list(onset_dates)), errors="coerce", dayfirst=dayfirst)
-    outcome = pd.to_datetime(pd.Series(list(outcome_dates)), errors="coerce", dayfirst=dayfirst)
-    delays = (outcome - onset).dt.days.to_numpy()
-    delays = delays[np.isfinite(delays) & (delays >= 0)]
-    return _make_discrete_pmf_from_delays(delays)
 
 
 # ---------------------------------------------------------------------------
