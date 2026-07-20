@@ -86,25 +86,6 @@ def _daily_complete_dates(df: pd.DataFrame, date_col: str, start: Optional[pd.Ti
     return pd.date_range(start=start, end=end, freq="D")
 
 
-def _make_discrete_pmf_from_delays(delays: np.ndarray) -> Dict[str, Any]:
-    delays = np.asarray(delays, dtype=float)
-    delays = delays[np.isfinite(delays)]
-    delays = delays[delays >= 0]
-    if delays.size == 0:
-        raise ValueError("No non-negative delays available to estimate a distribution.")
-    delays = delays.astype(int)
-    support = np.arange(int(delays.max()) + 1)
-    counts = np.bincount(delays, minlength=support.size).astype(float)
-    pmf = counts / counts.sum()
-    cdf = np.cumsum(pmf)
-    return {
-        "support": support,
-        "pmf": pmf,
-        "cdf": cdf,
-        "mean": float(delays.mean()),
-        "median": float(np.median(delays)),
-        "n": int(delays.size),
-    }
 
 def fit_parametric_delay_distribution(delays, family="gamma"):
     x = pd.Series(delays).astype(float)
@@ -496,8 +477,6 @@ def standardize_line_list(
 # ---------------------------------------------------------------------------
 # Delay distributions from individual-level data
 # ---------------------------------------------------------------------------
-
-
 
 
 
@@ -1173,11 +1152,37 @@ def running_cfr(
         if date_col is None:
             date_col = "report_date" if "report_date" in df.columns else "reference_date"
         if cases_col is None:
-            cases_col = "total_cases" if "total_cases" in df.columns else "cases"
+            cases_col = _first_existing_column(
+                df,
+                [
+                    "confirmed_cases",
+                    "total_confirmed_cases",
+                    "total_cases",
+                    "cases",
+                ],
+            )
+
         if deaths_col is None:
-            deaths_col = "total_deaths" if "total_deaths" in df.columns else "deaths"
-        if recovered_col is None and "total_cured" in df.columns:
-            recovered_col = "total_cured"
+            deaths_col = _first_existing_column(
+                df,
+                [
+                    "confirmed_deaths",
+                    "total_confirmed_deaths",
+                    "total_deaths",
+                    "deaths",
+                ],
+            )
+
+        if recovered_col is None:
+            recovered_col = _first_existing_column(
+                df,
+                [
+                    "confirmed_recovered",
+                    "total_confirmed_cured",
+                    "total_cured",
+                    "recovered",
+                ],
+            )
         return running_cfr_from_count_table(
             df,
             date_col=date_col,
