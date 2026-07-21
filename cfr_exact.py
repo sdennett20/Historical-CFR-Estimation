@@ -551,7 +551,7 @@ def cfr_resolved_cohort(deaths: Union[pd.Series, np.ndarray, float, int], recove
     return deaths / denom if denom > 0 else np.nan
 
 
-def cfr_delay_adjusted_nishiura(
+def cfr_delay_adjusted_nishiura_1(
     deaths: Union[pd.Series, np.ndarray, float, int],
     cases: Union[pd.Series, np.ndarray, float, int],
     delay_distribution: Any,
@@ -572,6 +572,100 @@ def cfr_delay_adjusted_nishiura(
     estimated_known_outcomes = float(np.sum(cases * known_outcome_prob))
     total_deaths = float(np.nansum(deaths))
     return total_deaths / estimated_known_outcomes if estimated_known_outcomes > 0 else np.nan
+
+def cfr_delay_adjusted_nishiura(
+    deaths: Union[pd.Series, np.ndarray, float, int],
+    cases: Union[pd.Series, np.ndarray, float, int],
+    delay_distribution: Any,
+) -> float:
+    """
+    Delay-adjusted confirmed CFR using daily incidence counts.
+
+    This estimates p_t by maximizing the binomial log-likelihood
+
+        D_t ~ Binomial(u_t * C_t, p_t)
+
+    where:
+        D_t = total deaths observed up to time t
+        C_t = incident cases by day up to time t
+        u_t = fraction of cases expected to have known outcomes by time t,
+              computed from the delay distribution.
+
+    Parameters
+    ----------
+    deaths:
+        Daily incident deaths up to time t.
+    cases:
+        Daily incident confirmed cases up to time t.
+    delay_distribution:
+        Delay from onset/confirmation to death. May be:
+        - a callable CDF: f(ages) -> probabilities
+        - a mapping with key "cdf" or "pmf"
+        - a 1D PMF/CDF-like array
+
+    Returns
+    -------
+    float
+        Maximum-likelihood estimate of the delay-adjusted CFR.
+    """
+
+    deaths = np.asarray(deaths, dtype=float).reshape(-1)
+    cases = np.asarray(cases, dtype=float).reshape(-1)
+    # print(deaths)
+    # print(cases)
+
+    if deaths.size != cases.size:
+        raise ValueError("deaths and cases must have the same length.")
+    if deaths.size == 0:
+        return np.nan
+
+    deaths = np.nan_to_num(deaths, nan=0.0)
+    cases = np.nan_to_num(cases, nan=0.0)
+
+    # Replace negative incidence caused by data revisions with zero
+    deaths = np.maximum(deaths, 0.0)
+    cases = np.maximum(cases, 0.0)
+
+    if np.any(deaths < 0) or np.any(cases < 0):
+        raise ValueError("deaths and cases must be non-negative incidence counts.")
+
+    ages = np.arange(cases.size - 1, -1, -1, dtype=int)
+    known_outcome_prob = _delay_cdf_at_ages(delay_distribution, ages)
+
+    u_t_c_t = float(np.sum(cases * known_outcome_prob))
+    d_t = float(np.sum(deaths))
+
+    if u_t_c_t <= 0:
+        return np.nan
+
+    # Numerical guard: the model requires d_t <= u_t_c_t
+    if d_t > u_t_c_t:
+        u_t_c_t = d_t
+
+    def neg_log_likelihood(x: np.ndarray) -> float:
+        p = float(x[0])
+        if p <= 0.0 or p >= 1.0:
+            return np.inf
+
+        return -(
+            d_t * np.log(p) +
+            (u_t_c_t - d_t) * np.log1p(-p)
+        )
+
+    # Start at the closed-form estimate for stability
+    p0 = np.clip(d_t / u_t_c_t, 1e-12, 1 - 1e-12)
+
+    res = minimize(
+        neg_log_likelihood,
+        x0=np.array([p0], dtype=float),
+        method="L-BFGS-B",
+        bounds=[(1e-12, 1 - 1e-12)],
+    )
+
+    if not res.success:
+        return float(p0)
+
+    return float(res.x[0])
 
 
 def _prepare_individual_time_data(
@@ -1287,9 +1381,14 @@ def adapt_drc_consolidated_to_counts(df: pd.DataFrame) -> pd.DataFrame:
     return pivot
 
 
+from typing import Dict
+import pandas as pd
+import numpy as np
+
 def adapt_rosello_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
     work["analysis_origin_date"] = _to_datetime(work["Date_of_onset_symp"], dayfirst=True)
+
     outcome = work["Outcome"].map(_safe_lower)
     event = pd.Series(
         np.where(
@@ -1299,6 +1398,7 @@ def adapt_rosello_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
         ),
         index=work.index,
     )
+
     outcome_date = pd.Series(pd.NaT, index=work.index, dtype="datetime64[ns]")
     if "Date_of_Death" in work.columns:
         outcome_date = outcome_date.fillna(_to_datetime(work["Date_of_Death"], dayfirst=True))
@@ -1306,10 +1406,32 @@ def adapt_rosello_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
         outcome_date = outcome_date.fillna(_to_datetime(work["Date_hospital_discharge"], dayfirst=True))
     if "Date_disease_ended" in work.columns:
         outcome_date = outcome_date.fillna(_to_datetime(work["Date_disease_ended"], dayfirst=True))
-    work = pd.DataFrame({"start_date": work["analysis_origin_date"], "outcome_date": outcome_date, "event": event})
-    work = work.dropna(subset=["start_date"]).copy()
-    return work
 
+    work = pd.DataFrame(
+        {
+            "start_date": work["analysis_origin_date"],
+            "outcome_date": outcome_date,
+            "event": event,
+        }
+    )
+    return work.dropna(subset=["start_date"]).copy()
+
+
+def adapt_rosello_to_linelist_by_outbreak(
+    df: pd.DataFrame,
+    outbreak_col: str = "Outbreak",
+) -> Dict[str, pd.DataFrame]:
+    if outbreak_col not in df.columns:
+        raise ValueError(f"Missing required column: {outbreak_col}")
+
+    out = {}
+    for outbreak_value, group in df.groupby(outbreak_col, dropna=False):
+        key = "missing" if pd.isna(outbreak_value) else str(outbreak_value)
+        ll = adapt_rosello_to_linelist(group).copy()
+        ll[outbreak_col] = outbreak_value
+        out[key] = ll.reset_index(drop=True)
+
+    return out
 
 def adapt_uganda_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
