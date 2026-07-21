@@ -1359,7 +1359,106 @@ def adapt_drc_health_zone_to_counts(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def adapt_drc_consolidated_to_counts(df: pd.DataFrame) -> pd.DataFrame:
+
+def adapt_drc_consolidated_to_counts(
+    df: pd.DataFrame,
+    *,
+    group_cols: Optional[Sequence[str]] = None,
+    prefer_confirmed: bool = True,
+) -> pd.DataFrame:
+    required = {"reference_date", "measure", "value"}
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Unexpected DRC consolidated schema. Missing: {missing}")
+
+    work = df.copy()
+    work["reference_date"] = _to_datetime(work["reference_date"])
+    work["measure"] = work["measure"].astype(str).str.strip().str.lower()
+
+    if "case_classification" in work.columns:
+        work["case_classification"] = work["case_classification"].astype(str).str.strip().str.lower()
+    else:
+        work["case_classification"] = ""
+
+    if "time_period" in work.columns:
+        tp = work["time_period"].astype(str).str.strip().str.lower()
+        work = work.loc[tp.eq("cumulative")].copy()
+
+    allowed_measures = {
+        "cases",
+        "deaths",
+        "recoveries",
+        "recovered",
+        "cured",
+        "total_cases",
+        "total_deaths",
+        "total_cured",
+    }
+    work = work.loc[work["measure"].isin(allowed_measures)].copy()
+
+    work["measure_key"] = np.where(
+        work["case_classification"].ne("") & work["case_classification"].ne("nan"),
+        work["case_classification"] + "_" + work["measure"],
+        work["measure"],
+    )
+
+    index_cols = ["reference_date"]
+    if group_cols:
+        index_cols += [c for c in group_cols if c in work.columns]
+
+    pivot = (
+        work.pivot_table(
+            index=index_cols,
+            columns="measure_key",
+            values="value",
+            aggfunc="sum",
+        )
+        .reset_index()
+        .rename(columns={"reference_date": "report_date"})
+    )
+    pivot.columns.name = None
+
+    def _first_non_missing(cols: Sequence[str]) -> pd.Series:
+        out = pd.Series(np.nan, index=pivot.index, dtype="float64")
+        for c in cols:
+            if c in pivot.columns:
+                out = out.combine_first(pd.to_numeric(pivot[c], errors="coerce"))
+        return out
+
+    if prefer_confirmed:
+        pivot["cases"] = _first_non_missing(
+            ["confirmed_cases", "probable_cases", "suspected_cases", "cases", "total_cases"]
+        )
+        pivot["deaths"] = _first_non_missing(
+            ["confirmed_deaths", "probable_deaths", "suspected_deaths", "deaths", "total_deaths"]
+        )
+        pivot["recovered"] = _first_non_missing(
+            [
+                "confirmed_recoveries", "confirmed_recovered",
+                "probable_recoveries", "probable_recovered",
+                "suspected_recoveries", "suspected_recovered",
+                "recoveries", "recovered", "cured", "total_cured"
+            ]
+        )
+    else:
+        pivot["cases"] = _first_non_missing(["cases", "total_cases"])
+        pivot["deaths"] = _first_non_missing(["deaths", "total_deaths"])
+        pivot["recovered"] = _first_non_missing(["recoveries", "recovered", "cured", "total_cured"])
+
+    if "total_cases" not in pivot.columns:
+        pivot["total_cases"] = pivot["cases"]
+    if "total_deaths" not in pivot.columns:
+        pivot["total_deaths"] = pivot["deaths"]
+    if "total_cured" not in pivot.columns:
+        pivot["total_cured"] = pivot["recovered"]
+
+    sort_cols = ["report_date"]
+    if group_cols:
+        sort_cols += [c for c in group_cols if c in pivot.columns]
+
+    return pivot.sort_values(sort_cols).reset_index(drop=True)
+
+def adapt_drc_consolidated_to_counts1(df: pd.DataFrame) -> pd.DataFrame:
     # This table is not a true cases/deaths time series, but it can be pivoted if desired.
     if "reference_date" not in df.columns or "measure" not in df.columns:
         raise ValueError("Unexpected DRC consolidated schema.")
