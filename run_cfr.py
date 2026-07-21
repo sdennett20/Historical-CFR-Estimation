@@ -73,7 +73,7 @@ results["has_recovery_data"] = (
 results.loc[~results["has_recovery_data"], "resolved"] = np.nan
 
 # Only keep data from one week after the first observation
-start_date = results["date"].min() + pd.Timedelta(days=7)
+start_date = results["date"].min() + pd.Timedelta(days=0)
 plot_results = results[results["date"] >= start_date]
 
 # Create the figure
@@ -204,3 +204,124 @@ plt.close()
 
 print("Results written to: cfr_results_uganda.csv")
 print("Figure written to: cfr_results_uganda.png")
+
+# Rosello
+from cfr_exact import adapt_rosello_to_linelist_by_outbreak
+df = pd.read_csv("Data/rosello2015_supplementary1.csv")
+
+linelists = adapt_rosello_to_linelist_by_outbreak(df)
+
+print(linelists.keys())          # outbreak names
+# print(linelists["Isiro"].head())
+# print(linelists["Kikwit"].head())
+# print(linelists["Boende"].head())
+# print(linelists["Mweka2007"].head())
+# print(linelists["Mweka2008"].head())
+# print(linelists["Yambuku"].head())
+
+# the below shows that there are only four cases with symptom onset dates in Mweka 2007
+print(linelists["Mweka2007"])
+linelists["Mweka2007"].to_csv("Mweka2007_linelist.csv", index=False)
+linelists["Boende"].to_csv("Boende_linelist.csv", index=False)
+
+methods = [
+    "naive",
+    "resolved",
+    "delay_adjusted",
+    "competing_risks",
+    "kaplan_meier",
+    "parametric_mixture",
+]
+
+skip = {"Mweka2007", "Tandala"}
+
+for name, ll in linelists.items():
+    if name in skip:
+        print(f"Skipping {name}")
+        continue
+    print(f"Analyzing {name}...")
+
+    # Fit delay distributions from the line list
+    delays = estimate_delay_distributions_from_individual_data(
+        ll,
+        onset_col="start_date",
+        outcome_date_col="outcome_date",
+        outcome_col="event",
+        dayfirst=True,   # Rosello-style dates; keep True unless you know otherwise
+    )
+
+    death_delay = delays["death"]["cdf"]
+    recovery_delay = delays.get("recovery", {}).get("cdf")
+
+    # Run CFR estimators
+    results = running_cfr(
+        ll,
+        dataset_kind="line_list",
+        methods=methods,
+        delay_distribution_death=death_delay,
+        delay_distribution_recovery=recovery_delay,
+        dayfirst=True,
+    )
+
+    # Save raw results
+    results.to_csv(f"cfr_results_{name}.csv", index=False)
+
+    # Prepare plotting
+    results["date"] = pd.to_datetime(results["date"])
+    results = results.sort_values("date").reset_index(drop=True)
+
+    # Hide resolved until the first recovery has been observed
+    recovery_dates = (
+        ll.loc[
+            (ll["event"] == "recovery") & ll["outcome_date"].notna(),
+            "outcome_date",
+        ]
+        .sort_values()
+        .to_numpy(dtype="datetime64[ns]")
+    )
+
+    if len(recovery_dates) > 0:
+        results["has_recovery_data"] = (
+            np.searchsorted(
+                recovery_dates,
+                results["date"].to_numpy(dtype="datetime64[ns]"),
+                side="right",
+            ) > 0
+        )
+        results.loc[~results["has_recovery_data"], "resolved"] = np.nan
+
+    # Start plotting from one week after first observation
+    start_date = results["date"].min() + pd.Timedelta(days=7)
+    plot_results = results[results["date"] >= start_date].copy()
+
+    # Mask failed mixture fits
+    if "parametric_mixture_success" in plot_results.columns:
+        plot_results.loc[
+            ~plot_results["parametric_mixture_success"],
+            "parametric_mixture",
+        ] = np.nan
+
+    # Plot
+    plt.figure(figsize=(10, 6))
+
+    for method in methods:
+        if method in plot_results.columns:
+            plt.plot(
+                plot_results["date"],
+                plot_results[method],
+                linewidth=2,
+                label=method,
+            )
+
+    plt.xlabel("Date")
+    plt.ylabel("Case Fatality Ratio")
+    plt.title(f"Running CFR Estimates - {name}")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    plt.savefig(f"cfr_results_{name}.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"Results written to: cfr_results_{name}.csv")
+    print(f"Figure written to: cfr_results_{name}.png")
