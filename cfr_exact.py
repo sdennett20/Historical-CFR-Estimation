@@ -757,6 +757,60 @@ def cfr_competing_risks(
 
     return float(cif_death)
 
+def cfr_ghani_2005_km(
+    df: pd.DataFrame,
+    *,
+    time_col: str = "time",
+    event_col: str = "event",
+    death_label: str = "death",
+    recovery_label: str = "recovery",
+) -> float:
+    """
+    Ghani et al. (2005) adapted Kaplan-Meier CFR estimator.
+
+    Returns a scalar CFR estimate.
+    """
+    _require_columns(df, [time_col, event_col])
+
+    work = df[[time_col, event_col]].copy()
+    work[time_col] = _coerce_numeric(work[time_col])
+    work[event_col] = work[event_col].map(_safe_lower)
+    work = work.dropna(subset=[time_col]).copy()
+
+    if work.empty:
+        return np.nan
+
+    times = work[time_col].to_numpy(dtype=float)
+    events = work[event_col].to_numpy(dtype=str)
+
+    valid = np.isfinite(times)
+    times = times[valid]
+    events = events[valid]
+
+    event_times = np.unique(times[np.isin(events, [death_label, recovery_label])])
+    if event_times.size == 0:
+        return np.nan
+
+    s = 1.0          # composite survival Θ
+    theta0 = 0.0     # death probability contribution
+    theta1 = 0.0     # recovery probability contribution
+
+    for t in np.sort(event_times):
+        at_risk = np.sum(times >= t)
+        if at_risk <= 0:
+            continue
+
+        d_death = np.sum((times == t) & (events == death_label))
+        d_rec = np.sum((times == t) & (events == recovery_label))
+        d_all = d_death + d_rec
+
+        theta0 += s * (d_death / at_risk)
+        theta1 += s * (d_rec / at_risk)
+
+        s *= (1.0 - d_all / at_risk)
+
+    denom = theta0 + theta1
+    return float(theta0 / denom) if denom > 0 else np.nan
 
 def cfr_kaplan_meier(
     df: pd.DataFrame,
@@ -800,6 +854,51 @@ def cfr_kaplan_meier(
     denom = p_death + p_recovery
     return float(p_death / denom) if denom > 0 else np.nan
 
+def km_death_standard(
+    df: pd.DataFrame,
+    *,
+    time_col: str = "time",
+    event_col: str = "event",
+    death_label: str = "death",
+) -> float:
+    """
+    Standard Kaplan-Meier estimator for death.
+
+    Deaths are treated as events.
+    Recoveries and censored observations are treated as right-censored.
+
+    Returns
+    -------
+    float
+        Estimated cumulative probability of death = 1 - S(t_max).
+    """
+
+    _require_columns(df, [time_col, event_col])
+
+    work = df[[time_col, event_col]].copy()
+    work[time_col] = _coerce_numeric(work[time_col])
+    work[event_col] = work[event_col].map(_safe_lower)
+    work = work.dropna(subset=[time_col])
+
+    if work.empty:
+        return np.nan
+
+    times = work[time_col].to_numpy(dtype=float)
+    events = work[event_col].to_numpy(dtype=str)
+
+    # Deaths are events; everything else is censored
+    death = events == death_label
+
+    s = 1.0
+
+    for t in np.sort(np.unique(times[death])):
+        at_risk = np.sum(times >= t)
+        d = np.sum((times == t) & death)
+
+        if at_risk > 0:
+            s *= (1.0 - d / at_risk)
+
+    return float(1.0 - s)
 
 def _mixture_negloglik(params: np.ndarray, times: np.ndarray, events: np.ndarray, family: str) -> float:
     """
@@ -1193,7 +1292,7 @@ def running_cfr_from_line_list(
         if "competing_risks" in methods:
             row["competing_risks"] = cfr_competing_risks(current)
         if "kaplan_meier" in methods:
-            row["kaplan_meier"] = cfr_kaplan_meier(current)
+            row["kaplan_meier"] = cfr_ghani_2005_km(current)
         if "parametric_mixture" in methods:
             mix = cfr_parametric_mixture(current, family="gamma")
             row["parametric_mixture"] = mix["cfr"]
@@ -1321,7 +1420,7 @@ __all__ = [
     "cfr_resolved_cohort",
     "cfr_delay_adjusted_nishiura",
     "cfr_competing_risks",
-    "cfr_kaplan_meier",
+    "cfr_ghani_2005_km",
     "cfr_parametric_mixture",
     "running_cfr_from_count_table",
     "running_cfr_from_line_list",
