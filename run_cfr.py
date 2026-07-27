@@ -45,7 +45,7 @@ print(results.head())
 
 
 # Save results to CSV
-results.to_csv("cfr_results_2018.csv", index=False)
+results.to_csv("Results/cfr_results_2018.csv", index=False)
 
 # Convert date column for plotting
 results["date"] = pd.to_datetime(results["date"])
@@ -91,7 +91,7 @@ plt.legend()
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
 
-plt.savefig("cfr_results_2018.png", dpi=300, bbox_inches="tight")
+plt.savefig("Results/cfr_results_2018.png", dpi=300, bbox_inches="tight")
 
 
 print("Results written to: cfr_results_2018.csv")
@@ -169,7 +169,7 @@ if "parametric_mixture_success" in plot_results.columns:
         "parametric_mixture",
     ] = np.nan
 # Save results
-results.to_csv("cfr_results_uganda.csv", index=False)
+results.to_csv("Results/cfr_results_uganda.csv", index=False)
 
 # Plot all methods that are present
 plt.figure(figsize=(10, 6))
@@ -199,7 +199,7 @@ plt.legend()
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
 
-plt.savefig("cfr_results_uganda.png", dpi=300, bbox_inches="tight")
+plt.savefig("Results/cfr_results_uganda.png", dpi=300, bbox_inches="tight")
 plt.close()
 
 print("Results written to: cfr_results_uganda.csv")
@@ -264,7 +264,7 @@ for name, ll in linelists.items():
     )
 
     # Save raw results
-    results.to_csv(f"cfr_results_{name}.csv", index=False)
+    results.to_csv(f"Results/cfr_results_{name}.csv", index=False)
 
     # Prepare plotting
     results["date"] = pd.to_datetime(results["date"])
@@ -320,7 +320,7 @@ for name, ll in linelists.items():
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
 
-    plt.savefig(f"cfr_results_{name}.png", dpi=300, bbox_inches="tight")
+    plt.savefig(f"Results/cfr_results_{name}.png", dpi=300, bbox_inches="tight")
     plt.close()
 
     print(f"Results written to: cfr_results_{name}.csv")
@@ -356,7 +356,7 @@ print(results.head())
 
 
 # Save results to CSV
-results.to_csv("cfr_results_2026.csv", index=False)
+results.to_csv("Results/cfr_results_2026.csv", index=False)
 
 # Convert date column for plotting
 results["date"] = pd.to_datetime(results["date"])
@@ -402,7 +402,7 @@ plt.legend()
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
 
-plt.savefig("cfr_results_2026.png", dpi=300, bbox_inches="tight")
+plt.savefig("Results/cfr_results_2026.png", dpi=300, bbox_inches="tight")
 
 
 print("Results written to: cfr_results_2026.csv")

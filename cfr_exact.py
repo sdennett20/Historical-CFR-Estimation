@@ -19,7 +19,7 @@ Supported estimator families:
 The point-estimate formulas are implemented directly from the published
 descriptions and the Epiverse reference implementation docs.
 
-Note that this code is made with AI and has not been checked yet. 
+Note that this code is made with AI and has not been fully checked. 
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ import pandas as pd
 from scipy.optimize import minimize
 from scipy.special import expit
 from scipy import stats
+from scipy.stats import beta
 
 # ---------------------------------------------------------------------------
 # Generic utilities
@@ -541,14 +542,20 @@ def estimate_delay_distributions_from_individual_data(
 def cfr_naive(deaths: Union[pd.Series, np.ndarray, float, int], cases: Union[pd.Series, np.ndarray, float, int]) -> float:
     deaths = float(np.nansum(deaths))
     cases = float(np.nansum(cases))
-    return deaths / cases if cases > 0 else np.nan
+    (lo,hi) = clopper_pearson_ci(deaths,cases)
+    return {"estimate": deaths / cases, 
+            "lower_ci":lo,
+            "upper_ci": hi} if cases > 0 else np.nan
 
 
 def cfr_resolved_cohort(deaths: Union[pd.Series, np.ndarray, float, int], recovered: Union[pd.Series, np.ndarray, float, int]) -> float:
     deaths = float(np.nansum(deaths))
     recovered = float(np.nansum(recovered))
     denom = deaths + recovered
-    return deaths / denom if denom > 0 else np.nan
+    (lo,hi) = clopper_pearson_ci(deaths,denom)
+    return {"estimate": deaths / denom, 
+            "lower_ci":lo,
+            "upper_ci": hi} if denom > 0 else np.nan
 
 
 def cfr_delay_adjusted_nishiura_1(
@@ -557,6 +564,7 @@ def cfr_delay_adjusted_nishiura_1(
     delay_distribution: Any,
 ) -> float:
     """
+    THIS ONE IS THE WRONG ONE
     Delay-adjusted static CFR per Nishiura et al. and the Epiverse cfr_static docs.
 
     Point estimate:
@@ -574,6 +582,63 @@ def cfr_delay_adjusted_nishiura_1(
     return total_deaths / estimated_known_outcomes if estimated_known_outcomes > 0 else np.nan
 
 def cfr_delay_adjusted_nishiura(
+    deaths: Sequence[float],
+    cases: Sequence[float],
+    delay_distribution: Any,
+    *,
+    poisson_threshold: int = 1000,
+) -> Dict[str, float]:
+    """
+    Profile-likelihood CI wrapper for delay-adjusted Nishiura CFR.
+
+    This uses:
+      total_cases   = sum(cases)
+      total_deaths  = sum(deaths)
+      total_outcomes = sum(cases * F(delay_age))
+
+    where F(delay_age) is the delay CDF at each age.
+    
+    Calculates the estimate and upper and lower boundaries of confidence intervals.
+
+    Estimates and confidence intervals 
+    """
+    deaths = np.asarray(deaths, dtype=float).reshape(-1)
+    cases = np.asarray(cases, dtype=float).reshape(-1)
+
+    if deaths.size != cases.size:
+        raise ValueError("deaths and cases must have the same length.")
+    if deaths.size == 0:
+        return {
+            "estimate": np.nan,
+            "lower_ci": np.nan,
+            "upper_ci": np.nan,
+        }
+
+    deaths = np.nan_to_num(deaths, nan=0.0)
+    cases = np.nan_to_num(cases, nan=0.0)
+
+    deaths = np.maximum(deaths, 0.0)
+    cases = np.maximum(cases, 0.0)
+
+    ages = np.arange(cases.size - 1, -1, -1, dtype=int)
+    known_outcome_prob = _delay_cdf_at_ages(delay_distribution, ages)
+
+    total_cases = float(np.sum(cases))
+    total_deaths = float(np.sum(deaths))
+    total_outcomes = float(np.sum(cases * known_outcome_prob))
+
+    p_mid = (total_deaths / round(total_outcomes)) if round(total_outcomes) > 0 else np.nan
+
+    return estimate_severity_profile_likelihood(
+        total_cases=total_cases,
+        total_deaths=total_deaths,
+        total_outcomes=total_outcomes,
+        poisson_threshold=poisson_threshold,
+        p_mid=p_mid,
+    )
+
+
+def cfr_delay_adjusted_nishiura_2(
     deaths: Union[pd.Series, np.ndarray, float, int],
     cases: Union[pd.Series, np.ndarray, float, int],
     delay_distribution: Any,
@@ -812,93 +877,6 @@ def cfr_ghani_2005_km(
     denom = theta0 + theta1
     return float(theta0 / denom) if denom > 0 else np.nan
 
-def cfr_kaplan_meier(
-    df: pd.DataFrame,
-    *,
-    time_col: str = "time",
-    event_col: str = "event",
-    death_label: str = "death",
-    recovery_label: str = "recovery",
-) -> float:
-    """
-    Ghani et al. adapted Kaplan-Meier estimator:
-        CFR = P(death) / (P(death) + P(recovery))
-    with each outcome estimated by a separate KM curve, treating the other
-    outcome and censoring as censored.
-    """
-    _require_columns(df, [time_col, event_col])
-    work = df[[time_col, event_col]].copy()
-    work[time_col] = _coerce_numeric(work[time_col])
-    work[event_col] = work[event_col].map(_safe_lower)
-    work = work.dropna(subset=[time_col]).copy()
-
-    times = work[time_col].to_numpy(dtype=float)
-    events = work[event_col].to_numpy(dtype=str)
-
-    def _km_survival(event_of_interest: str) -> float:
-        # treat competing outcomes and censoring as censored
-        observed = events == event_of_interest
-        unique_times = np.unique(times[observed])
-        s = 1.0
-        for t in np.sort(unique_times):
-            at_risk = np.sum(times >= t)
-            d = np.sum((times == t) & observed)
-            if at_risk > 0:
-                s *= (1.0 - d / at_risk)
-        return s
-
-    s_death = _km_survival(death_label)
-    s_recovery = _km_survival(recovery_label)
-    p_death = 1.0 - s_death
-    p_recovery = 1.0 - s_recovery
-    denom = p_death + p_recovery
-    return float(p_death / denom) if denom > 0 else np.nan
-
-def km_death_standard(
-    df: pd.DataFrame,
-    *,
-    time_col: str = "time",
-    event_col: str = "event",
-    death_label: str = "death",
-) -> float:
-    """
-    Standard Kaplan-Meier estimator for death.
-
-    Deaths are treated as events.
-    Recoveries and censored observations are treated as right-censored.
-
-    Returns
-    -------
-    float
-        Estimated cumulative probability of death = 1 - S(t_max).
-    """
-
-    _require_columns(df, [time_col, event_col])
-
-    work = df[[time_col, event_col]].copy()
-    work[time_col] = _coerce_numeric(work[time_col])
-    work[event_col] = work[event_col].map(_safe_lower)
-    work = work.dropna(subset=[time_col])
-
-    if work.empty:
-        return np.nan
-
-    times = work[time_col].to_numpy(dtype=float)
-    events = work[event_col].to_numpy(dtype=str)
-
-    # Deaths are events; everything else is censored
-    death = events == death_label
-
-    s = 1.0
-
-    for t in np.sort(np.unique(times[death])):
-        at_risk = np.sum(times >= t)
-        d = np.sum((times == t) & death)
-
-        if at_risk > 0:
-            s *= (1.0 - d / at_risk)
-
-    return float(1.0 - s)
 
 def _mixture_negloglik(params: np.ndarray, times: np.ndarray, events: np.ndarray, family: str) -> float:
     """
@@ -1117,9 +1095,237 @@ def cfr_parametric_mixture(
 
 
 # ---------------------------------------------------------------------------
-# Daily running estimates
+# Confidence intervals
 # ---------------------------------------------------------------------------
 
+
+def clopper_pearson_ci(x: float, n: float, alpha: float = 0.05) -> Tuple[float, float]:
+    """
+    Exact Clopper-Pearson confidence interval for a binomial proportion. These are used for the naive and resolved estimates.
+
+    Parameters
+    ----------
+    x : int or float
+        Number of "successes" (e.g. deaths).
+    n : int or float
+        Number of trials (e.g. cases, or resolved cases).
+    alpha : float
+        Significance level. 0.05 gives a 95% CI.
+
+    Returns
+    -------
+    (lo, hi)
+        Lower and upper confidence limits.
+    """
+    x = int(x)
+    n = int(n)
+
+    if n <= 0:
+        return (np.nan, np.nan)
+
+    if x < 0 or x > n:
+        raise ValueError("Need 0 <= x <= n for Clopper-Pearson CI.")
+
+    if x == 0:
+        lo = 0.0
+    else:
+        lo = beta.ppf(alpha / 2.0, x, n - x + 1)
+
+    if x == n:
+        hi = 1.0
+    else:
+        hi = beta.ppf(1.0 - alpha / 2.0, x + 1, n - x)
+
+    return float(lo), float(hi)
+
+
+
+
+def _binom_logchoose(n: int, k: int) -> float:
+    if k < 0 or k > n:
+        return -np.inf
+    return math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
+
+
+def _select_func_likelihood(total_cases: float, poisson_threshold: int, p_mid: float) -> Callable[[float, float, np.ndarray], np.ndarray]:
+    """
+    Python translation of the R .select_func_likelihood() helper.
+
+    Returns a function f(total_outcomes, total_deaths, pp_grid) -> log-likelihood values.
+    """
+
+    total_cases = float(total_cases)
+    p_mid = float(p_mid)
+
+    # Binomial approximation
+    if total_cases < poisson_threshold or p_mid >= 0.05:
+        def func_likelihood(total_outcomes: float, total_deaths: float, pp: np.ndarray) -> np.ndarray:
+            n = int(round(total_outcomes))
+            k = int(round(total_deaths))
+            pp = np.asarray(pp, dtype=float)
+
+            out = np.full(pp.shape, -np.inf, dtype=float)
+            valid = (pp > 0.0) & (pp < 1.0) & np.isfinite(pp)
+            if not np.any(valid):
+                return out
+
+            out[valid] = (
+                _binom_logchoose(n, k)
+                + k * np.log(pp[valid])
+                + (n - k) * np.log1p(-pp[valid])
+            )
+            return out
+
+        return func_likelihood
+
+    # Poisson approximation
+    if total_cases >= poisson_threshold and p_mid < 0.05:
+        warnings.warn(
+            f"Total cases = {total_cases} and p = {p_mid:.3g}: using Poisson approximation to binomial likelihood.",
+            RuntimeWarning,
+        )
+
+        def func_likelihood(total_outcomes: float, total_deaths: float, pp: np.ndarray) -> np.ndarray:
+            mu = np.asarray(pp, dtype=float) * float(round(total_outcomes))
+            k = int(round(total_deaths))
+
+            out = np.full(mu.shape, -np.inf, dtype=float)
+            valid = (mu > 0.0) & np.isfinite(mu)
+            if not np.any(valid):
+                return out
+
+            # log Poisson pmf:
+            # log P(K=k | mu) = k log(mu) - mu - log(k!)
+            log_k_fact = math.lgamma(k + 1)
+            out[valid] = k * np.log(mu[valid]) - mu[valid] - log_k_fact
+            return out
+
+        return func_likelihood
+
+    # Fallback should not be reached, but keep it safe
+    def func_likelihood(total_outcomes: float, total_deaths: float, pp: np.ndarray) -> np.ndarray:
+        n = int(round(total_outcomes))
+        k = int(round(total_deaths))
+        pp = np.asarray(pp, dtype=float)
+
+        out = np.full(pp.shape, -np.inf, dtype=float)
+        valid = (pp > 0.0) & (pp < 1.0) & np.isfinite(pp)
+        if not np.any(valid):
+            return out
+
+        out[valid] = (
+            _binom_logchoose(n, k)
+            + k * np.log(pp[valid])
+            + (n - k) * np.log1p(-pp[valid])
+        )
+        return out
+
+    return func_likelihood
+
+
+def estimate_severity_profile_likelihood(
+    total_cases: float,
+    total_deaths: float,
+    total_outcomes: float,
+    poisson_threshold: int = 1000,
+    p_mid: Optional[float] = None,
+) -> Dict[str, float]:
+    """
+    Python translation of the R .estimate_severity() function.
+
+    Parameters
+    ----------
+    total_cases
+        Total cases observed.
+    total_deaths
+        Total deaths observed.
+    total_outcomes
+        Total expected outcomes (for the delay-adjusted method, this is the
+        expected number of cases with known outcomes, i.e. sum(cases * F(delay))).
+    poisson_threshold
+        Threshold above which the Poisson approximation may be used.
+    p_mid
+        Initial severity estimate used to choose the approximation.
+        If omitted, defaults to total_deaths / round(total_outcomes), matching the R code.
+
+    Returns
+    -------
+    dict
+        {"estimate", "lower_ci", "upper_ci"}
+    """
+    total_cases = float(total_cases)
+    total_deaths = float(total_deaths)
+    total_outcomes = float(total_outcomes)
+
+    # Special case: when any two are zero, return NA-like values
+    if sum(v == 0 for v in [total_cases, total_deaths, total_outcomes]) >= 2:
+        return {
+            "estimate": np.nan,
+            "lower_ci": np.nan,
+            "upper_ci": np.nan,
+        }
+
+    if p_mid is None:
+        rounded_outcomes = int(round(total_outcomes))
+        p_mid = (total_deaths / rounded_outcomes) if rounded_outcomes > 0 else np.nan
+
+    # If expected outcomes are fewer than deaths, the R code returns NA
+    if total_outcomes < total_deaths:
+        warnings.warn(
+            f"Total deaths = {total_deaths} and expected outcomes = {round(total_outcomes)}; returning NaN.",
+            RuntimeWarning,
+        )
+        return {
+            "estimate": np.nan,
+            "lower_ci": np.nan,
+            "upper_ci": np.nan,
+        }
+
+    func_likelihood = _select_func_likelihood(total_cases, poisson_threshold, p_mid)
+
+    # Profile over severity grid
+    p_grid = np.arange(1e-4, 1.0000 + 1e-4, 1e-4)
+    lik = func_likelihood(total_outcomes, total_deaths, p_grid)
+
+    if not np.any(np.isfinite(lik)):
+        return {
+            "estimate": np.nan,
+            "lower_ci": np.nan,
+            "upper_ci": np.nan,
+        }
+
+    max_lik = np.nanmax(lik)
+    best_idx = np.nanargmax(lik)
+    estimate = float(p_grid[best_idx])
+
+    # 95% profile likelihood CI: logL >= max(logL) - 1.92
+    keep = np.where(lik >= (max_lik - 1.92))[0]
+    if keep.size == 0:
+        lower_ci = np.nan
+        upper_ci = np.nan
+    else:
+        lower_ci = float(p_grid[keep[0]])
+        upper_ci = float(p_grid[keep[-1]])
+
+    return {
+        "estimate": estimate,
+        "lower_ci": lower_ci,
+        "upper_ci": upper_ci,
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# Daily running estimates
+# ---------------------------------------------------------------------------
+def _unpack_est_ci(x):
+    if isinstance(x, dict):
+        return (
+            x.get("estimate", x.get("severity_estimate", np.nan)),
+            x.get("lower_ci", x.get("severity_low", np.nan)),
+            x.get("upper_ci", x.get("severity_high", np.nan)),
+        )
+    return float(x), np.nan, np.nan
 
 def running_cfr_from_count_table(
     df: pd.DataFrame,
@@ -1182,21 +1388,33 @@ def running_cfr_from_count_table(
                     row[c] = g[c].iloc[0]
 
             if "naive" in methods:
-                row["naive"] = cfr_naive(deaths[i], cases[i])
+                # row["naive"] = _extract_point_estimate(cfr_naive(deaths[i], cases[i]))
+                est, lo, hi = _unpack_est_ci(cfr_naive(deaths[i], cases[i]))
+                row["naive"] = est
+                row["naive_lower"] = lo
+                row["naive_upper"] = hi
+                # row["naive"] = deaths / cases if cases > 0 else np.nan                
             if "resolved" in methods:
                 if recovered is None:
                     row["resolved"] = np.nan
                 else:
-                    row["resolved"] = cfr_resolved_cohort(deaths[i], recovered[i])
+                    est, lo, hi = _unpack_est_ci(cfr_resolved_cohort(deaths[i], recovered[i]))
+                    row["resolved"] = est
+                    row["resolved_lower"] = lo
+                    row["resolved_upper"] = hi
+                    # row["resolved"] = _extract_point_estimate(cfr_resolved_cohort(deaths[i], recovered[i]))
             if "delay_adjusted" in methods:
                 if delay_distribution is None:
                     row["delay_adjusted"] = np.nan
                 else:
-                    row["delay_adjusted"] = cfr_delay_adjusted_nishiura(
+                    est, lo, hi = _unpack_est_ci(cfr_delay_adjusted_nishiura(
                         deaths=deaths_inc[: i + 1],
                         cases=cases_inc[: i + 1],
                         delay_distribution=delay_distribution,
-                    )
+                    ))
+                    row["delay_adjusted"] = est
+                    row["delay_adjusted_lower"] = lo
+                    row["delay_adjusted_upper"] = hi
             rows.append(row)
 
     return pd.DataFrame(rows)
@@ -1239,7 +1457,6 @@ def running_cfr_from_line_list(
 
     dates = pd.DatetimeIndex(sorted(pd.unique(linelist["start_date"].dropna())))
     rows = []
-
     for cutoff in dates:
         current = _prepare_individual_time_data(
             linelist,
@@ -1256,10 +1473,19 @@ def running_cfr_from_line_list(
             recovered = float(np.sum((observed_start["event"] == recovery_label) & (observed_start["outcome_date"].notna()) & (observed_start["outcome_date"] <= cutoff)))
 
             if "naive" in methods:
-                row["naive"] = deaths / cases if cases > 0 else np.nan
+                naive = cfr_naive(deaths, cases)
+                row["naive"] = naive["estimate"]
+                row["naive_lower"] = naive["lower_ci"]
+                row["naive_upper"] = naive["upper_ci"]
+                # row["naive"] = deaths / cases if cases > 0 else np.nan
             if "resolved" in methods:
-                denom = deaths + recovered
-                row["resolved"] = deaths / denom if denom > 0 else np.nan
+                est, hi, lo = _unpack_est_ci(cfr_resolved_cohort(deaths, recovered))
+                
+                row["resolved"] = est
+                row["resolved_lower"] = hi
+                row["resolved_upper"] = lo
+                # denom = deaths + recovered
+                # row["resolved"] = deaths / denom if denom > 0 else np.nan
             if "delay_adjusted" in methods:
                 if delay_distribution_death is None:
                     row["delay_adjusted"] = np.nan
@@ -1283,11 +1509,14 @@ def running_cfr_from_line_list(
                             .reindex(cohort_dates, fill_value=0)
                             .to_numpy(dtype=float)
                         )
-                        row["delay_adjusted"] = cfr_delay_adjusted_nishiura(
+                        est, hi, lo = _unpack_est_ci(cfr_delay_adjusted_nishiura(
                             deaths=deaths_daily,
                             cases=cases_daily,
                             delay_distribution=delay_distribution_death,
-                        )
+                        ))
+                        row["delay_adjusted"] = est
+                        row["delay_adjusted_lower"] = hi
+                        row["delay_adjusted_upper"] = lo
 
         if "competing_risks" in methods:
             row["competing_risks"] = cfr_competing_risks(current)
