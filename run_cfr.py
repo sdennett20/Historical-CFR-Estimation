@@ -3,6 +3,38 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
+import matplotlib.colors as mcolors
+
+# helper for plotting 
+def plot_method_with_ci(ax, data, method, *, alpha=0.18, linewidth=2, label=None):
+    y = data[method]
+    lo_col = f"{method}_lower"
+    hi_col = f"{method}_upper"
+
+    # draw the line first
+    line, = ax.plot(
+        data["date"],
+        y,
+        linewidth=linewidth,
+        label=label or method,
+    )
+
+    # draw the shaded CI if available
+    if lo_col in data.columns and hi_col in data.columns:
+        mask = y.notna() & data[lo_col].notna() & data[hi_col].notna()
+        if mask.any():
+            ax.fill_between(
+                data.loc[mask, "date"],
+                data.loc[mask, lo_col],
+                data.loc[mask, hi_col],
+                color=line.get_color(),
+                alpha=alpha,
+                linewidth=0,
+            )
+
+    return line
+
+
 
 # DRC 2018 
 df = pd.read_csv("Data/DRC2018_humdata_MOH-Total.csv", skiprows=range(1,11))
@@ -70,7 +102,8 @@ results["has_recovery_data"] = (
     .eq(True)
 )
 
-results.loc[~results["has_recovery_data"], "resolved"] = np.nan
+mask = ~results["has_recovery_data"]
+results.loc[mask, ["resolved", "resolved_lower", "resolved_upper"]] = np.nan
 
 # Only keep data from one week after the first observation
 start_date = results["date"].min() + pd.Timedelta(days=0)
@@ -81,8 +114,25 @@ plt.figure(figsize=(10, 6))
 
 for method in ["naive", "resolved", "delay_adjusted"]:
     if method in plot_results.columns:
-        plt.plot(plot_results["date"], plot_results[method],
-                 linewidth=2, label=method)
+
+        line, = plt.plot(
+            plot_results["date"],
+            plot_results[method],
+            linewidth=2,
+            label=method,
+        )
+
+        lower = f"{method}_lower"
+        upper = f"{method}_upper"
+
+        if lower in plot_results.columns and upper in plot_results.columns:
+            plt.fill_between(
+                plot_results["date"],
+                plot_results[lower],
+                plot_results[upper],
+                color=line.get_color(),
+                alpha=0.2,
+            )
 
 plt.xlabel("Date")
 plt.ylabel("Case Fatality Ratio")
@@ -185,16 +235,29 @@ methods = [
 
 for method in methods:
     if method in plot_results.columns:
-        plt.plot(
+
+        line, = plt.plot(
             plot_results["date"],
             plot_results[method],
             linewidth=2,
             label=method,
         )
 
+        lower = f"{method}_lower"
+        upper = f"{method}_upper"
+
+        if lower in plot_results.columns and upper in plot_results.columns:
+            plt.fill_between(
+                plot_results["date"],
+                plot_results[lower],
+                plot_results[upper],
+                color=line.get_color(),
+                alpha=0.2,
+            )
+
 plt.xlabel("Date")
 plt.ylabel("Case Fatality Ratio")
-plt.title("Running CFR Estimates - Uganda 2022")
+plt.title("Running CFR Estimates")
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
@@ -306,20 +369,32 @@ for name, ll in linelists.items():
 
     for method in methods:
         if method in plot_results.columns:
-            plt.plot(
+
+            line, = plt.plot(
                 plot_results["date"],
                 plot_results[method],
                 linewidth=2,
                 label=method,
             )
 
+            lower = f"{method}_lower"
+            upper = f"{method}_upper"
+
+            if lower in plot_results.columns and upper in plot_results.columns:
+                plt.fill_between(
+                    plot_results["date"],
+                    plot_results[lower],
+                    plot_results[upper],
+                    color=line.get_color(),
+                    alpha=0.2,
+                )
+
     plt.xlabel("Date")
     plt.ylabel("Case Fatality Ratio")
-    plt.title(f"Running CFR Estimates - {name}")
+    plt.title("Running CFR Estimates")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-
     plt.savefig(f"Results/cfr_results_{name}.png", dpi=300, bbox_inches="tight")
     plt.close()
 
@@ -381,7 +456,12 @@ results["has_recovery_data"] = (
     .eq(True)
 )
 
-results.loc[~results["has_recovery_data"], "resolved"] = np.nan
+mask = ~results["has_recovery_data"]
+
+results.loc[
+    mask,
+    ["resolved", "resolved_lower", "resolved_upper"]
+] = np.nan
 
 # Only keep data from one week after the first observation
 start_date = results["date"].min() + pd.Timedelta(days=0)
@@ -392,8 +472,25 @@ plt.figure(figsize=(10, 6))
 
 for method in ["naive", "resolved", "delay_adjusted"]:
     if method in plot_results.columns:
-        plt.plot(plot_results["date"], plot_results[method],
-                 linewidth=2, label=method)
+
+        line, = plt.plot(
+            plot_results["date"],
+            plot_results[method],
+            linewidth=2,
+            label=method,
+        )
+
+        lower = f"{method}_lower"
+        upper = f"{method}_upper"
+
+        if lower in plot_results.columns and upper in plot_results.columns:
+            plt.fill_between(
+                plot_results["date"],
+                plot_results[lower],
+                plot_results[upper],
+                color=line.get_color(),
+                alpha=0.2,
+            )
 
 plt.xlabel("Date")
 plt.ylabel("Case Fatality Ratio")

@@ -2056,11 +2056,11 @@ def running_cfr_from_line_list(
                 row["naive_upper"] = naive["upper_ci"]
                 # row["naive"] = deaths / cases if cases > 0 else np.nan
             if "resolved" in methods:
-                est, hi, lo = _unpack_est_ci(cfr_resolved_cohort(deaths, recovered))
+                est, lo, hi = _unpack_est_ci(cfr_resolved_cohort(deaths, recovered))
                 
                 row["resolved"] = est
-                row["resolved_lower"] = hi
-                row["resolved_upper"] = lo
+                row["resolved_lower"] = lo
+                row["resolved_upper"] = hi
                 # denom = deaths + recovered
                 # row["resolved"] = deaths / denom if denom > 0 else np.nan
             if "delay_adjusted" in methods:
@@ -2086,22 +2086,22 @@ def running_cfr_from_line_list(
                             .reindex(cohort_dates, fill_value=0)
                             .to_numpy(dtype=float)
                         )
-                        est, hi, lo = _unpack_est_ci(cfr_delay_adjusted_nishiura(
+                        est, lo, hi = _unpack_est_ci(cfr_delay_adjusted_nishiura(
                             deaths=deaths_daily,
                             cases=cases_daily,
                             delay_distribution=delay_distribution_death,
                         ))
                         row["delay_adjusted"] = est
-                        row["delay_adjusted_lower"] = hi
-                        row["delay_adjusted_upper"] = lo
+                        row["delay_adjusted_lower"] = lo
+                        row["delay_adjusted_upper"] = hi
 
         if "competing_risks" in methods:
-            est, hi, lo = _unpack_est_ci(cfr_competing_risks(current))
+            est, lo, hi = _unpack_est_ci(cfr_competing_risks(current))
             row["competing_risks"] = est
-            row["competing_risks_lower"] = hi
-            row["competing_risks_upper"] = lo
+            row["competing_risks_lower"] = lo
+            row["competing_risks_upper"] = hi
         if "kaplan_meier" in methods:
-            est, hi, lo = _unpack_est_ci(cfr_ghani_2005_km(current))
+            est, lo, hi = _unpack_est_ci(cfr_ghani_2005_km(current))
             row["kaplan_meier"] = est
             row["kaplan_meier_upper"] = hi
             row["kaplan_meier_lower"] = lo
