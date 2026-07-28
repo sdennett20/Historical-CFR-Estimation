@@ -33,10 +33,11 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
-from scipy.special import expit
+from scipy.special import expit, logit
 from scipy import stats
-from scipy.stats import beta
+from scipy.stats import beta, chi2, norm
+from functools import lru_cache
+from scipy.optimize import minimize, root_scalar
 
 # ---------------------------------------------------------------------------
 # Generic utilities
@@ -773,8 +774,176 @@ def _prepare_individual_time_data(
     work["event"] = event
     return work[["time", "event"]].copy()
 
-
+# options for CIs: bootstrap, wald, wald after log log transformation, https://link.springer.com/article/10.1007/s10985-018-09458-6#Sec13
 def cfr_competing_risks(
+    df: pd.DataFrame,
+    *,
+    time_col: str = "time",
+    event_col: str = "event",
+    death_label: str = "death",
+    recovery_label: str = "recovery",
+    alpha: float = 0.05,
+    untrans: bool = False,
+    return_ci: bool = False,
+) -> Union[float, Dict[str, Any]]:
+    """
+    Exact Aalen-Johansen cumulative incidence for death in the presence of recovery
+    as a competing event.
+
+    The point estimate is the Aalen-Johansen CIF for death. When return_ci=True,
+    a Greenwood-type Wald interval is returned using a delta-method covariance
+    recursion for the state probabilities (survival, death CIF, recovery CIF).
+    """
+    _require_columns(df, [time_col, event_col])
+    work = df[[time_col, event_col]].copy()
+    work[time_col] = _coerce_numeric(work[time_col])
+    work[event_col] = work[event_col].map(_safe_lower)
+    work = work.dropna(subset=[time_col]).copy()
+
+    times = work[time_col].to_numpy(dtype=float)
+    events = work[event_col].to_numpy(dtype=str)
+
+    valid = np.isfinite(times)
+    times = times[valid]
+    events = events[valid]
+
+    if times.size == 0:
+        return np.nan if not return_ci else {
+            "estimate": np.nan,
+            "lower_ci": np.nan,
+            "upper_ci": np.nan,
+            "se_cfr": np.nan,
+            "n_cases": 0,
+            "n_deaths": 0,
+            "n_recoveries": 0,
+            "variance_method": "greenwood",
+            "ci_method": "raw" if untrans else "logit",
+        }
+
+    # Only event times (death or recovery)
+    event_times = np.unique(times[np.isin(events, [death_label, recovery_label])])
+    if event_times.size == 0:
+        return np.nan if not return_ci else {
+           "estimate": np.nan,
+            "lower_ci": np.nan,
+            "upper_ci": np.nan,
+            "se_cfr": np.nan,
+            "n_cases": int(times.size),
+            "n_deaths": 0,
+            "n_recoveries": 0,
+            "variance_method": "greenwood",
+            "ci_method": "raw" if untrans else "logit",
+        }
+
+    # State vector: [S, F_death, F_recovery]
+    x = np.array([1.0, 0.0, 0.0], dtype=float)
+    Sigma = np.zeros((3, 3), dtype=float)
+
+    n_deaths = 0
+    n_recoveries = 0
+
+    for t in np.sort(event_times):
+        at_risk = float(np.sum(times >= t))
+        if at_risk <= 0:
+            continue
+
+        d_death = float(np.sum((times == t) & (events == death_label)))
+        d_rec = float(np.sum((times == t) & (events == recovery_label)))
+        d_all = d_death + d_rec
+        if d_all <= 0:
+            continue
+
+        n_deaths += int(d_death)
+        n_recoveries += int(d_rec)
+
+        a = d_death / at_risk
+        b = d_rec / at_risk
+        c = max(0.0, 1.0 - a - b)
+        S_prev = x[0]
+
+        # Jacobian wrt previous state probabilities
+        A = np.array(
+            [
+                [c, 0.0, 0.0],
+                [a, 1.0, 0.0],
+                [b, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+
+        # Jacobian wrt current step event probabilities [a, b]
+        B = np.array(
+            [
+                [-S_prev, -S_prev],
+                [S_prev, 0.0],
+                [0.0, S_prev],
+            ],
+            dtype=float,
+        )
+
+        # Multinomial Greenwood-type covariance for (a, b)
+        V = np.array(
+            [
+                [a * (1.0 - a), -a * b],
+                [-a * b, b * (1.0 - b)],
+            ],
+            dtype=float,
+        ) / at_risk
+
+        # Recursion for covariance of [S, CIF_death, CIF_recovery]
+        Sigma = A @ Sigma @ A.T + B @ V @ B.T
+
+        # Update state probabilities
+        x = np.array(
+            [
+                S_prev * c,
+                x[1] + S_prev * a,
+                x[2] + S_prev * b,
+            ],
+            dtype=float,
+        )
+
+    estimate = float(x[1])
+    variance = float(Sigma[1, 1])
+    se = float(np.sqrt(max(variance, 0.0))) if np.isfinite(variance) else np.nan
+
+    if not return_ci:
+        return estimate
+
+    z = float(stats.norm.ppf(1.0 - alpha / 2.0))
+
+    if untrans:
+        lower = estimate - z * se if np.isfinite(se) else np.nan
+        upper = estimate + z * se if np.isfinite(se) else np.nan
+        lower = float(np.clip(lower, 0.0, 1.0)) if np.isfinite(lower) else np.nan
+        upper = float(np.clip(upper, 0.0, 1.0)) if np.isfinite(upper) else np.nan
+        ci_method = "raw"
+    else:
+        eps = 1e-12
+        p = float(np.clip(estimate, eps, 1.0 - eps))
+        if np.isfinite(se):
+            var_logit = variance / ((p * (1.0 - p)) ** 2)
+            se_logit = float(np.sqrt(max(var_logit, 0.0)))
+            lower = float(expit(logit(p) - z * se_logit))
+            upper = float(expit(logit(p) + z * se_logit))
+        else:
+            lower = np.nan
+            upper = np.nan
+        ci_method = "logit"
+
+    return {
+        "estimate": estimate,
+        "lower_ci": lower,
+        "upper_ci": upper,
+        "se_cfr": se,
+        "n_cases": int(times.size),
+        "n_deaths": int(n_deaths),
+        "n_recoveries": int(n_recoveries),
+        "variance_method": "greenwood",
+        "ci_method": ci_method,
+    }
+
+def cfr_competing_risk1(
     df: pd.DataFrame,
     *,
     time_col: str = "time",
@@ -822,7 +991,236 @@ def cfr_competing_risks(
 
     return float(cif_death)
 
+
+
+def _greenwood_var_survival(y, d_all, s):
+    """
+    Greenwood variance for the composite survival curve S(t).
+    y     : number at risk at each event time
+    d_all : total failures (death + recovery) at each event time
+    s     : survival values S(t) at each event time
+    """
+    cum = 0.0
+    var = np.empty_like(s, dtype=float)
+
+    for i, (yi, di, si) in enumerate(zip(y, d_all, s)):
+        if yi <= 0:
+            var[i] = np.nan
+            continue
+        if di > 0:
+            if yi > di:
+                cum += di / (yi * (yi - di))
+                var[i] = (si ** 2) * cum
+            else:
+                # Boundary case: all at risk fail at this time.
+                # Greenwood becomes unstable here; return NaN.
+                var[i] = np.nan
+        else:
+            var[i] = (si ** 2) * cum
+
+    return var
+
+
 def cfr_ghani_2005_km(
+    df: pd.DataFrame,
+    *,
+    time_col: str = "time",
+    event_col: str = "event",
+    death_label: str = "death",
+    recovery_label: str = "recovery",
+    greenwood: bool = False,
+    untrans: bool = False,
+    alpha: float = 0.05,
+) -> dict:
+    """
+    Ghani et al. KM-like CFR estimator with Stata-style confidence intervals.
+
+    Returns
+    -------
+    dict with keys:
+      estimate, lower_ci, upper_ci, se_cfr, theta0, theta1,
+      n_cases, n_dead, n_recovered, ci_method
+    """
+    _require_columns(df, [time_col, event_col])
+
+    work = df[[time_col, event_col]].copy()
+    work[time_col] = _coerce_numeric(work[time_col])
+    work[event_col] = work[event_col].map(_safe_lower)
+    work = work.dropna(subset=[time_col]).copy()
+
+    if work.empty:
+        return {
+            "estimate": np.nan,
+            "lower_ci": np.nan,
+            "upper_ci": np.nan,
+            "se_cfr": np.nan,
+            "theta0": np.nan,
+            "theta1": np.nan,
+            "n_cases": 0,
+            "n_dead": 0,
+            "n_recovered": 0,
+            "ci_method": "greenwood" if greenwood else "alt",
+        }
+
+    times = work[time_col].to_numpy(dtype=float)
+    events = work[event_col].to_numpy(dtype=str)
+
+    valid = np.isfinite(times)
+    times = times[valid]
+    events = events[valid]
+
+    # Unique times where either death or recovery occurs
+    event_times = np.sort(np.unique(times[np.isin(events, [death_label, recovery_label])]))
+    if event_times.size == 0:
+        return {
+            "estimate": np.nan,
+            "lower_ci": np.nan,
+            "upper_ci": np.nan,
+            "se_cfr": np.nan,
+            "theta0": np.nan,
+            "theta1": np.nan,
+            "n_cases": int(len(times)),
+            "n_dead": 0,
+            "n_recovered": 0,
+            "ci_method": "greenwood" if greenwood else "alt",
+        }
+
+    y = []
+    d_death = []
+    d_rec = []
+    d_all = []
+    S = []
+    h_dead = []
+    h_rec = []
+
+    theta0 = 0.0
+    theta1 = 0.0
+    s_prev = 1.0
+
+    for t in event_times:
+        yi = float(np.sum(times >= t))
+        dd = float(np.sum((times == t) & (events == death_label)))
+        dr = float(np.sum((times == t) & (events == recovery_label)))
+        da = dd + dr
+
+        y.append(yi)
+        d_death.append(dd)
+        d_rec.append(dr)
+        d_all.append(da)
+
+        hd = dd / yi if yi > 0 else np.nan
+        hr = dr / yi if yi > 0 else np.nan
+        h_dead.append(hd)
+        h_rec.append(hr)
+
+        # cumulative incidence contributions
+        theta0 += s_prev * hd if np.isfinite(hd) else 0.0
+        theta1 += s_prev * hr if np.isfinite(hr) else 0.0
+
+        s_t = s_prev * (1.0 - da / yi) if yi > 0 else np.nan
+        S.append(s_t)
+        s_prev = s_t if np.isfinite(s_t) else s_prev
+
+    y = np.asarray(y, dtype=float)
+    d_death = np.asarray(d_death, dtype=float)
+    d_rec = np.asarray(d_rec, dtype=float)
+    d_all = np.asarray(d_all, dtype=float)
+    S = np.asarray(S, dtype=float)
+    h_dead = np.asarray(h_dead, dtype=float)
+    h_rec = np.asarray(h_rec, dtype=float)
+
+    denom = theta0 + theta1
+    cfr = theta0 / denom if denom > 0 else np.nan
+
+    # Stata's nstar = (Ntot + Nevent) / 2
+    n_total = float(len(times))
+    n_event = float(np.sum(d_all))
+    nstar = (n_total + n_event) / 2.0 if n_total > 0 else np.nan
+
+    if greenwood:
+        # Approximation to Stata's sts gen se(s) for the composite survival
+        varS = _greenwood_var_survival(y, d_all, S)
+        OM = np.diag(varS)
+        for j in range(len(event_times)):
+            for k in range(j):
+                if np.isfinite(varS[k]) and np.isfinite(S[j]) and S[k] > 0:
+                    OM[j, k] = varS[k] * S[j] / S[k]
+                    OM[k, j] = OM[j, k]
+                else:
+                    OM[j, k] = np.nan
+                    OM[k, j] = np.nan
+        ci_method = "greenwood_logit" if not untrans else "greenwood_raw"
+    else:
+        T = S
+        OM = np.outer(T, 1.0 - T) / nstar
+        for k in range(len(event_times)):
+            for j in range(k + 1, len(event_times)):
+                OM[k, j] = T[k] * (1.0 - T[j]) / nstar
+                OM[j, k] = OM[k, j]
+        ci_method = "alt_logit" if not untrans else "alt_raw"
+
+    hv_dead = h_dead.reshape(-1, 1)
+    hv_rec = h_rec.reshape(-1, 1)
+
+    B_dead = float(hv_dead.T @ OM @ hv_dead)
+    B_rec = float(hv_rec.T @ OM @ hv_rec)
+    cov01 = float(hv_dead.T @ OM @ hv_rec)
+
+    A_dead = (S ** 2) * h_dead / y
+    A_rec = (S ** 2) * h_rec / y
+
+    var_dead = float(np.nansum(A_dead) + B_dead)
+    var_rec = float(np.nansum(A_rec) + B_rec)
+
+    var_cfr = (
+        (theta1 ** 2) * var_dead
+        + (theta0 ** 2) * var_rec
+        - 2.0 * theta0 * theta1 * cov01
+    ) / ((theta0 + theta1) ** 4) if denom > 0 else np.nan
+
+    se_cfr = float(np.sqrt(var_cfr)) if np.isfinite(var_cfr) and var_cfr >= 0 else np.nan
+
+    z = float(norm.ppf(1.0 - alpha / 2.0))
+
+    if untrans:
+        lower = cfr - z * se_cfr if np.isfinite(se_cfr) else np.nan
+        upper = cfr + z * se_cfr if np.isfinite(se_cfr) else np.nan
+    else:
+        # Stata default: logit transform
+        eps = 1e-12
+        p = float(np.clip(cfr, eps, 1.0 - eps))
+        if theta0 > 0 and theta1 > 0 and np.isfinite(var_dead) and np.isfinite(var_rec):
+            var_logit = (
+                var_dead / (theta0 ** 2)
+                + var_rec / (theta1 ** 2)
+                - 2.0 * cov01 / (theta0 * theta1)
+            )
+            se_logit = float(np.sqrt(var_logit)) if np.isfinite(var_logit) and var_logit >= 0 else np.nan
+            if np.isfinite(se_logit):
+                lower = float(expit(logit(p) - z * se_logit))
+                upper = float(expit(logit(p) + z * se_logit))
+            else:
+                lower = np.nan
+                upper = np.nan
+        else:
+            lower = np.nan
+            upper = np.nan
+
+    return {
+        "estimate": float(cfr),
+        "lower_ci": float(lower) if np.isfinite(lower) else np.nan,
+        "upper_ci": float(upper) if np.isfinite(upper) else np.nan,
+        "se_cfr": float(se_cfr) if np.isfinite(se_cfr) else np.nan,
+        "theta0": float(theta0),
+        "theta1": float(theta1),
+        "n_cases": int(n_total),
+        "n_dead": int(np.sum(d_death)),
+        "n_recovered": int(np.sum(d_rec)),
+        "ci_method": ci_method,
+    }
+
+
+def cfr_ghani_2005_km1(
     df: pd.DataFrame,
     *,
     time_col: str = "time",
@@ -964,7 +1362,186 @@ def _mixture_negloglik(params: np.ndarray, times: np.ndarray, events: np.ndarray
     return -float(ll)
 
 
+
+def _nuisance_bounds_for_family(family: str):
+    if family in {"gamma", "weibull"}:
+        return [(-8, 8), (-8, 8), (-8, 8), (-8, 8)]
+    if family == "lognormal":
+        return [(-8, 8), (-10, 10), (-8, 8), (-10, 10)]
+    raise ValueError("family must be one of {'gamma', 'weibull', 'lognormal'}")
+
+
+def _default_nuisance_start(full_x: np.ndarray) -> np.ndarray:
+    # full_x = [logit_p, nuisance...]
+    return np.asarray(full_x[1:], dtype=float).copy()
+
+
+def _profile_loglik_for_p(times, events, family, p_fixed, nuisance_start, maxiter=5000):
+    """
+    Profile log-likelihood at a fixed CFR value p_fixed:
+    maximize over nuisance parameters only.
+    """
+    p_fixed = float(np.clip(p_fixed, 1e-12, 1 - 1e-12))
+    logit_p_fixed = float(logit(p_fixed))
+    bounds = _nuisance_bounds_for_family(family)
+
+    def obj(nuis):
+        params = np.concatenate(([logit_p_fixed], np.asarray(nuis, dtype=float)))
+        return _mixture_negloglik(params, times, events, family)
+
+    res = minimize(
+        obj,
+        x0=np.asarray(nuisance_start, dtype=float),
+        method="L-BFGS-B",
+        bounds=bounds,
+        options={"maxiter": maxiter},
+    )
+    return -float(res.fun), res
+
+
+def _lr_ci_for_mixture(times, events, family, full_res, alpha=0.05, maxiter=5000):
+    """
+    Likelihood-ratio CI for the CFR p in a parametric mixture model.
+    """
+    p_hat = float(expit(full_res.x[0]))
+    ll_max = -float(full_res.fun)
+    crit = float(chi2.ppf(1.0 - alpha, df=1))  # 3.84 for alpha=0.05
+    target = ll_max - 0.5 * crit
+
+    nuisance_start = _default_nuisance_start(full_res.x)
+    cache = {}
+
+    def prof_ll(p):
+        p = float(np.clip(p, 1e-12, 1 - 1e-12))
+        key = round(p, 12)
+        if key not in cache:
+            ll, _ = _profile_loglik_for_p(
+                times, events, family, p, nuisance_start, maxiter=maxiter
+            )
+            cache[key] = ll
+        return cache[key]
+
+    def g(p):
+        return prof_ll(p) - target
+
+    # If the optimum itself is below target something is badly wrong,
+    # but guard anyway.
+    if g(p_hat) < 0:
+        return np.nan, np.nan
+
+    eps = 1e-8
+
+    # Search lower side
+    lower = np.nan
+    if p_hat > eps:
+        grid = np.linspace(eps, p_hat, 25)
+        vals = [g(p) for p in grid]
+        lo_idx = None
+        for i in range(len(grid) - 1):
+            if vals[i] < 0 <= vals[i + 1]:
+                lo_idx = i
+                break
+        if lo_idx is not None:
+            sol = root_scalar(lambda p: g(p), bracket=(grid[lo_idx], grid[lo_idx + 1]), method="brentq")
+            lower = float(sol.root)
+        else:
+            lower = eps if vals[0] >= 0 else np.nan
+
+    # Search upper side
+    upper = np.nan
+    if p_hat < 1 - eps:
+        grid = np.linspace(p_hat, 1 - eps, 25)
+        vals = [g(p) for p in grid]
+        hi_idx = None
+        for i in range(len(grid) - 1):
+            if vals[i] >= 0 > vals[i + 1]:
+                hi_idx = i
+                break
+        if hi_idx is not None:
+            sol = root_scalar(lambda p: g(p), bracket=(grid[hi_idx], grid[hi_idx + 1]), method="brentq")
+            upper = float(sol.root)
+        else:
+            upper = 1 - eps if vals[-1] >= 0 else np.nan
+
+    return lower, upper
+
+
 def cfr_parametric_mixture(
+    df: pd.DataFrame,
+    *,
+    time_col: str = "time",
+    event_col: str = "event",
+    family: str = "gamma",
+    death_label: str = "death",
+    recovery_label: str = "recovery",
+    start_params=None,
+    maxiter: int = 5000,
+    alpha: float = 0.05,
+) -> dict:
+    _require_columns(df, [time_col, event_col])
+    work = df[[time_col, event_col]].copy()
+    work[time_col] = _coerce_numeric(work[time_col])
+    work[event_col] = work[event_col].map(_safe_lower)
+    work = work.dropna(subset=[time_col]).copy()
+
+    times = work[time_col].to_numpy(dtype=float)
+    events = work[event_col].to_numpy(dtype=str)
+    valid = np.isfinite(times)
+    times = np.maximum(times[valid], 1e-12)
+    events = events[valid]
+
+    if np.sum(events == death_label) + np.sum(events == recovery_label) == 0:
+        return {
+            "estimate": np.nan,
+            "lower_ci": np.nan,
+            "upper_ci": np.nan,
+            "family": family,
+            "success": False,
+            "message": "No resolved outcomes available for mixture model.",
+            "result": None,
+        }
+
+    p0 = np.mean(events == death_label)
+    p0 = min(max(p0, 1e-4), 1 - 1e-4)
+    med = float(np.median(times)) if np.isfinite(np.median(times)) else 1.0
+    med = max(med, 1e-3)
+
+    if start_params is None:
+        if family in {"gamma", "weibull"}:
+            start_params = [np.log(p0 / (1.0 - p0)), 0.0, np.log(med), 0.0, np.log(med)]
+        elif family == "lognormal":
+            start_params = [np.log(p0 / (1.0 - p0)), np.log(0.5), np.log(med), np.log(0.5), np.log(med)]
+        else:
+            raise ValueError("family must be one of {'gamma', 'weibull', 'lognormal'}")
+
+    x0 = np.asarray(start_params, dtype=float)
+    bounds = [(-10, 10), *_nuisance_bounds_for_family(family)]
+
+    res = minimize(
+        _mixture_negloglik,
+        x0,
+        args=(times, events, family),
+        method="L-BFGS-B",
+        bounds=bounds,
+        options={"maxiter": maxiter},
+    )
+
+    p_hat = float(expit(res.x[0]))
+    lower, upper = _lr_ci_for_mixture(times, events, family, res, alpha=alpha, maxiter=maxiter)
+
+    out = {
+        "estimate": p_hat,
+        "lower_ci": lower,
+        "upper_ci": upper,
+        "family": family,
+        "success": bool(res.success),
+        "message": str(res.message),
+        "result": res,
+    }
+
+    return out
+
+def cfr_parametric_mixture1(
     df: pd.DataFrame,
     *,
     time_col: str = "time",
@@ -1519,12 +2096,20 @@ def running_cfr_from_line_list(
                         row["delay_adjusted_upper"] = lo
 
         if "competing_risks" in methods:
-            row["competing_risks"] = cfr_competing_risks(current)
+            est, hi, lo = _unpack_est_ci(cfr_competing_risks(current))
+            row["competing_risks"] = est
+            row["competing_risks_lower"] = hi
+            row["competing_risks_upper"] = lo
         if "kaplan_meier" in methods:
-            row["kaplan_meier"] = cfr_ghani_2005_km(current)
+            est, hi, lo = _unpack_est_ci(cfr_ghani_2005_km(current))
+            row["kaplan_meier"] = est
+            row["kaplan_meier_upper"] = hi
+            row["kaplan_meier_lower"] = lo
         if "parametric_mixture" in methods:
             mix = cfr_parametric_mixture(current, family="gamma")
-            row["parametric_mixture"] = mix["cfr"]
+            row["parametric_mixture"] = mix["estimate"]
+            row["parametric_mixture_lower"] = mix["lower_ci"]
+            row["parametric_mixture_upper"] = mix["upper_ci"]
             row["parametric_mixture_success"] = mix["success"]
 
         rows.append(row)
@@ -1808,9 +2393,6 @@ def adapt_drc_consolidated_to_counts1(df: pd.DataFrame) -> pd.DataFrame:
     return pivot
 
 
-from typing import Dict
-import pandas as pd
-import numpy as np
 
 def adapt_rosello_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
