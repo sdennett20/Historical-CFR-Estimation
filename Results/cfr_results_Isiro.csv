@@ -1,4 +1,4 @@
-date,n,naive,naive_lower,naive_upper,resolved,resolved_lower,resolved_upper,delay_adjusted,delay_adjusted_lower,delay_adjusted_upper,competing_risks,competing_risks_lower,competing_risks_upper,kaplan_meier,kaplan_meier_upper,kaplan_meier_lower,parametric_mixture,parametric_mixture_lower,parametric_mixture_upper,parametric_mixture_success
+date,n,naive,naive_lower,naive_upper,resolved,resolved_lower,resolved_upper,delay_adjusted,delay_adjusted_lower,delay_adjusted_upper,competing_risks,competing_risks_lower,competing_risks_upper,kaplan_meier_ghani,kaplan_meier_ghani_upper,kaplan_meier_ghani_lower,parametric_mixture,parametric_mixture_lower,parametric_mixture_upper,parametric_mixture_success
 2012-06-01,1,0.0,0.0,0.975,,,,,,,,,,,,,,,,False
 2012-06-07,2,0.5,0.01257911709342505,0.9874208829065749,1.0,0.025,1.0,,,,1.0,,,1.0,,,0.9999032181782538,0.14648588593743947,0.99999999,True
 2012-06-12,3,0.3333333333333333,0.008403758659612636,0.9057006759497539,1.0,0.025,1.0,,,,1.0,,,1.0,,,0.9999546021312976,0.14649341369536123,0.99999999,True

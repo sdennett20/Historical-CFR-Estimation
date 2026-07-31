@@ -1,4 +1,4 @@
-from cfr_exact import running_cfr, adapt_drc_total_to_counts
+from cfr_exact import running_cfr, adapt_drc_total_to_counts, adapt_rosello_to_linelist
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
@@ -177,7 +177,7 @@ recovery_delay = delays.get("recovery",{}).get("cdf")
 results = running_cfr(
     ll,
     dataset_kind="line_list",
-    methods=["naive", "resolved", "delay_adjusted", "competing_risks", "kaplan_meier", "parametric_mixture"],
+    methods=["naive", "resolved", "delay_adjusted", "competing_risks", "kaplan_meier_ghani", "parametric_mixture"],
     delay_distribution_death=death_delay,
     delay_distribution_recovery=recovery_delay,
     dayfirst=False,
@@ -229,7 +229,7 @@ methods = [
     "resolved",
     "delay_adjusted",
     "competing_risks",
-    "kaplan_meier",
+    "kaplan_meier_ghani",
     "parametric_mixture",
 ]
 
@@ -273,7 +273,10 @@ from cfr_exact import adapt_rosello_to_linelist_by_outbreak
 df = pd.read_csv("Data/rosello2015_supplementary1.csv")
 
 linelists = adapt_rosello_to_linelist_by_outbreak(df)
-
+linelists["Mweka2007"] = adapt_rosello_to_linelist(
+    df[df["Outbreak"] == "Mweka2007"],
+    start_date_col="Date_of_notification",
+)
 print(linelists.keys())          # outbreak names
 # print(linelists["Isiro"].head())
 # print(linelists["Kikwit"].head())
@@ -283,7 +286,15 @@ print(linelists.keys())          # outbreak names
 # print(linelists["Yambuku"].head())
 
 # the below shows that there are only four cases with symptom onset dates in Mweka 2007
-print(linelists["Mweka2007"])
+print(linelists["Mweka2007"].head(20))
+print(linelists["Mweka2008"].head(20))
+ll = linelists["Mweka2008"]
+
+print(ll["event"].value_counts())
+
+print(
+    ll.groupby("event")["outcome_date"].apply(lambda x: x.notna().sum())
+)
 linelists["Mweka2007"].to_csv("Mweka2007_linelist.csv", index=False)
 linelists["Boende"].to_csv("Boende_linelist.csv", index=False)
 
@@ -292,11 +303,11 @@ methods = [
     "resolved",
     "delay_adjusted",
     "competing_risks",
-    "kaplan_meier",
+    "kaplan_meier_ghani",
     "parametric_mixture",
 ]
 
-skip = {"Mweka2007", "Tandala"}
+skip = {"Tandala"}
 
 for name, ll in linelists.items():
     if name in skip:
@@ -315,7 +326,12 @@ for name, ll in linelists.items():
 
     death_delay = delays["death"]["cdf"]
     recovery_delay = delays.get("recovery", {}).get("cdf")
-
+    shape_death = delays["death"]["shape"]
+    scale_death = delays["death"]["scale"]
+    shape_recovery = delays.get("recovery", {}).get("shape")
+    scale_recovery = delays.get("recovery", {}).get("scale")
+    print(f"delay distribution death is Gamma {shape_death}, {scale_death}")
+    print(f"delay distribution recovery is Gamma {shape_recovery}, {scale_recovery}")
     # Run CFR estimators
     results = running_cfr(
         ll,

@@ -2029,7 +2029,7 @@ def running_cfr_from_line_list(
     )
 
     if methods is None:
-        methods = ["naive", "resolved", "delay_adjusted", "competing_risks", "kaplan_meier", "parametric_mixture"]
+        methods = ["naive", "resolved", "delay_adjusted", "competing_risks", "kaplan_meier_ghani", "parametric_mixture"]
     methods = list(methods)
 
     dates = pd.DatetimeIndex(sorted(pd.unique(linelist["start_date"].dropna())))
@@ -2100,11 +2100,11 @@ def running_cfr_from_line_list(
             row["competing_risks"] = est
             row["competing_risks_lower"] = lo
             row["competing_risks_upper"] = hi
-        if "kaplan_meier" in methods:
+        if "kaplan_meier_ghani" in methods:
             est, lo, hi = _unpack_est_ci(cfr_ghani_2005_km(current))
-            row["kaplan_meier"] = est
-            row["kaplan_meier_upper"] = hi
-            row["kaplan_meier_lower"] = lo
+            row["kaplan_meier_ghani"] = est
+            row["kaplan_meier_ghani_upper"] = hi
+            row["kaplan_meier_ghani_lower"] = lo
         if "parametric_mixture" in methods:
             mix = cfr_parametric_mixture(current, family="gamma")
             row["parametric_mixture"] = mix["estimate"]
@@ -2394,9 +2394,15 @@ def adapt_drc_consolidated_to_counts1(df: pd.DataFrame) -> pd.DataFrame:
 
 
 
-def adapt_rosello_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
+def adapt_rosello_to_linelist(
+    df: pd.DataFrame,
+    start_date_col: str = "Date_of_onset_symp",
+) -> pd.DataFrame:
     work = df.copy()
-    work["analysis_origin_date"] = _to_datetime(work["Date_of_onset_symp"], dayfirst=True)
+    work["analysis_origin_date"] = _to_datetime(
+    work[start_date_col],
+    dayfirst=True,
+)
 
     outcome = work["Outcome"].map(_safe_lower)
     event = pd.Series(
