@@ -297,18 +297,6 @@ def load_uganda_2022(path: Union[str, Path]) -> pd.DataFrame:
     return df
 
 
-def load_sierra_leone_confirmed(path: Union[str, Path]) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    if "Date of symptom onset " in df.columns:
-        df["Date of symptom onset "] = _to_datetime(df["Date of symptom onset "], dayfirst=True)
-    if "Date of sample tested" in df.columns:
-        df["Date of sample tested"] = _to_datetime(df["Date of sample tested"], dayfirst=True)
-    return df
-
-
-def load_sierra_leone_suspected(path: Union[str, Path]) -> pd.DataFrame:
-    return load_sierra_leone_confirmed(path)
-
 
 # ---------------------------------------------------------------------------
 # Standardization helpers for count tables and line lists
@@ -417,7 +405,10 @@ def standardize_line_list(
         out.loc[death_mask, "event"] = death_label
         out.loc[rec_mask, "event"] = recovery_label
         out.loc[~(death_mask | rec_mask), "event"] = "censored"
-        return out.dropna(subset=["start_date"]).copy()
+
+        # Exclude impossible records: outcome before onset
+        valid_outcome = out["outcome_date"].isna() | (out["outcome_date"] >= out["start_date"])
+        return out.loc[valid_outcome].dropna(subset=["start_date"]).copy()
 
     if onset_col is None:
         onset_col = _first_existing_column(work, [
@@ -472,6 +463,10 @@ def standardize_line_list(
     standardized.loc[death_mask, "event"] = death_label
     standardized.loc[rec_mask, "event"] = recovery_label
     standardized.loc[~(death_mask | rec_mask), "event"] = "censored"
+
+    # Exclude impossible records: outcome before onset
+    valid_outcome = standardized["outcome_date"].isna() | (standardized["outcome_date"] >= standardized["start_date"])
+    standardized = standardized.loc[valid_outcome].copy()
 
     return standardized
 
@@ -534,6 +529,46 @@ def estimate_delay_distributions_from_individual_data(
         raise ValueError("No valid delays found to estimate any distribution.")
 
     return out
+def _estimate_delay_distribution_for_analysis_date(
+    df: pd.DataFrame,
+    *,
+    analysis_date: pd.Timestamp,
+    onset_col: str = "start_date",
+    outcome_date_col: str = "outcome_date",
+    outcome_col: str = "event",
+    death_label: str = "death",
+    recovery_label: str = "recovery",
+    dayfirst: bool = True,
+    family: str = "gamma",
+) -> Dict[str, Dict[str, Any]]:
+    """Estimate delay distributions using only information available by analysis_date."""
+    work = df[[onset_col, outcome_date_col, outcome_col]].copy()
+    work[onset_col] = _to_datetime(work[onset_col], dayfirst=dayfirst)
+    work[outcome_date_col] = _to_datetime(work[outcome_date_col], dayfirst=dayfirst)
+    work[outcome_col] = work[outcome_col].map(_safe_lower)
+
+    cutoff = pd.to_datetime(analysis_date)
+    observed = work.loc[
+        work[onset_col].notna()
+        & (work[onset_col] <= cutoff)
+        & work[outcome_date_col].notna()
+        & (work[outcome_date_col] <= cutoff)
+    ].copy()
+
+    if observed.empty:
+        raise ValueError("No resolved outcomes observed by analysis_date.")
+
+    return estimate_delay_distributions_from_individual_data(
+        observed,
+        onset_col=onset_col,
+        outcome_date_col=outcome_date_col,
+        outcome_col=outcome_col,
+        death_label=death_label,
+        recovery_label=recovery_label,
+        dayfirst=dayfirst,
+        family=family,
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -559,33 +594,12 @@ def cfr_resolved_cohort(deaths: Union[pd.Series, np.ndarray, float, int], recove
             "upper_ci": hi} if denom > 0 else np.nan
 
 
-def cfr_delay_adjusted_nishiura_1(
-    deaths: Union[pd.Series, np.ndarray, float, int],
-    cases: Union[pd.Series, np.ndarray, float, int],
-    delay_distribution: Any,
-) -> float:
-    """
-    THIS ONE IS THE WRONG ONE
-    Delay-adjusted static CFR per Nishiura et al. and the Epiverse cfr_static docs.
 
-    Point estimate:
-        CFR_hat = D_t / sum_i c_i * F(t - i)
-    where F is the CDF of the onset-to-death delay distribution.
-    """
-    deaths = np.asarray(deaths, dtype=float)
-    cases = np.asarray(cases, dtype=float)
-    if deaths.size != cases.size:
-        raise ValueError("deaths and cases must have the same length.")
-    ages = np.arange(len(cases) - 1, -1, -1)
-    known_outcome_prob = _delay_cdf_at_ages(delay_distribution, ages)
-    estimated_known_outcomes = float(np.sum(cases * known_outcome_prob))
-    total_deaths = float(np.nansum(deaths))
-    return total_deaths / estimated_known_outcomes if estimated_known_outcomes > 0 else np.nan
 
 def cfr_delay_adjusted_nishiura(
     deaths: Sequence[float],
     cases: Sequence[float],
-    delay_distribution: Any,
+    delay_distribution: None,
     *,
     poisson_threshold: int = 1000,
 ) -> Dict[str, float]:
@@ -622,7 +636,9 @@ def cfr_delay_adjusted_nishiura(
     cases = np.maximum(cases, 0.0)
 
     ages = np.arange(cases.size - 1, -1, -1, dtype=int)
-    known_outcome_prob = _delay_cdf_at_ages(delay_distribution, ages)
+    
+    delay_dist_here = delay_distribution
+    known_outcome_prob = _delay_cdf_at_ages(delay_dist_here, ages)
 
     total_cases = float(np.sum(cases))
     total_deaths = float(np.sum(deaths))
@@ -639,99 +655,6 @@ def cfr_delay_adjusted_nishiura(
     )
 
 
-def cfr_delay_adjusted_nishiura_2(
-    deaths: Union[pd.Series, np.ndarray, float, int],
-    cases: Union[pd.Series, np.ndarray, float, int],
-    delay_distribution: Any,
-) -> float:
-    """
-    Delay-adjusted confirmed CFR using daily incidence counts.
-
-    This estimates p_t by maximizing the binomial log-likelihood
-
-        D_t ~ Binomial(u_t * C_t, p_t)
-
-    where:
-        D_t = total deaths observed up to time t
-        C_t = incident cases by day up to time t
-        u_t = fraction of cases expected to have known outcomes by time t,
-              computed from the delay distribution.
-
-    Parameters
-    ----------
-    deaths:
-        Daily incident deaths up to time t.
-    cases:
-        Daily incident confirmed cases up to time t.
-    delay_distribution:
-        Delay from onset/confirmation to death. May be:
-        - a callable CDF: f(ages) -> probabilities
-        - a mapping with key "cdf" or "pmf"
-        - a 1D PMF/CDF-like array
-
-    Returns
-    -------
-    float
-        Maximum-likelihood estimate of the delay-adjusted CFR.
-    """
-
-    deaths = np.asarray(deaths, dtype=float).reshape(-1)
-    cases = np.asarray(cases, dtype=float).reshape(-1)
-    # print(deaths)
-    # print(cases)
-
-    if deaths.size != cases.size:
-        raise ValueError("deaths and cases must have the same length.")
-    if deaths.size == 0:
-        return np.nan
-
-    deaths = np.nan_to_num(deaths, nan=0.0)
-    cases = np.nan_to_num(cases, nan=0.0)
-
-    # Replace negative incidence caused by data revisions with zero
-    deaths = np.maximum(deaths, 0.0)
-    cases = np.maximum(cases, 0.0)
-
-    if np.any(deaths < 0) or np.any(cases < 0):
-        raise ValueError("deaths and cases must be non-negative incidence counts.")
-
-    ages = np.arange(cases.size - 1, -1, -1, dtype=int)
-    known_outcome_prob = _delay_cdf_at_ages(delay_distribution, ages)
-
-    u_t_c_t = float(np.sum(cases * known_outcome_prob))
-    d_t = float(np.sum(deaths))
-
-    if u_t_c_t <= 0:
-        return np.nan
-
-    # Numerical guard: the model requires d_t <= u_t_c_t
-    if d_t > u_t_c_t:
-        u_t_c_t = d_t
-
-    def neg_log_likelihood(x: np.ndarray) -> float:
-        p = float(x[0])
-        if p <= 0.0 or p >= 1.0:
-            return np.inf
-
-        return -(
-            d_t * np.log(p) +
-            (u_t_c_t - d_t) * np.log1p(-p)
-        )
-
-    # Start at the closed-form estimate for stability
-    p0 = np.clip(d_t / u_t_c_t, 1e-12, 1 - 1e-12)
-
-    res = minimize(
-        neg_log_likelihood,
-        x0=np.array([p0], dtype=float),
-        method="L-BFGS-B",
-        bounds=[(1e-12, 1 - 1e-12)],
-    )
-
-    if not res.success:
-        return float(p0)
-
-    return float(res.x[0])
 
 
 def _prepare_individual_time_data(
@@ -784,7 +707,7 @@ def cfr_competing_risks(
     recovery_label: str = "recovery",
     alpha: float = 0.05,
     untrans: bool = False,
-    return_ci: bool = False,
+    return_ci: bool = True,
 ) -> Union[float, Dict[str, Any]]:
     """
     Exact Aalen-Johansen cumulative incidence for death in the presence of recovery
@@ -1939,24 +1862,57 @@ def running_cfr_from_count_table(
     group_cols = [c for c in (group_cols or []) if c in work.columns]
     rows = []
 
+    def _apply_pseudo_realtime_downward_correction(series: np.ndarray) -> np.ndarray:
+        """
+        Retroactively cap earlier cumulative values whenever a later lower value appears.
+        This preserves the pseudo-real-time logic: once a revision is observed, all prior
+        days are revised downward to the minimum seen so far.
+        """
+        arr = np.asarray(series, dtype=float).copy()
+        if arr.size == 0:
+            return arr
+
+        last_seen = np.nan
+        for i in range(arr.size):
+            if not np.isfinite(arr[i]):
+                continue
+
+            if np.isfinite(last_seen) and arr[i] < last_seen:
+                arr[:i] = np.where(np.isfinite(arr[:i]), np.minimum(arr[:i], arr[i]), arr[:i])
+
+            last_seen = arr[i]
+
+        return arr
+
     group_iter = [(None, work)] if not group_cols else list(work.groupby(group_cols, dropna=False, sort=False))
 
     for _, g in group_iter:
         g = g.sort_values(date_col).reset_index(drop=True)
 
-        cases = g[cases_col].ffill().fillna(0.0).to_numpy(dtype=float) if is_cumulative else g[cases_col].fillna(0.0).to_numpy(dtype=float)
-        deaths = g[deaths_col].ffill().fillna(0.0).to_numpy(dtype=float) if is_cumulative else g[deaths_col].fillna(0.0).to_numpy(dtype=float)
-        recovered = None
-        if recovered_col and recovered_col in g.columns:
-            recovered = g[recovered_col].ffill().fillna(0.0).to_numpy(dtype=float) if is_cumulative else g[recovered_col].fillna(0.0).to_numpy(dtype=float)
+        cases_raw = g[cases_col].ffill().fillna(0.0).to_numpy(dtype=float) if is_cumulative else g[cases_col].fillna(0.0).to_numpy(dtype=float)
+        deaths_raw = g[deaths_col].ffill().fillna(0.0).to_numpy(dtype=float) if is_cumulative else g[deaths_col].fillna(0.0).to_numpy(dtype=float)
 
-        # incident series for delay adjustment
+        recovered_raw = None
+        if recovered_col and recovered_col in g.columns:
+            recovered_raw = g[recovered_col].ffill().fillna(0.0).to_numpy(dtype=float) if is_cumulative else g[recovered_col].fillna(0.0).to_numpy(dtype=float)
+
+        # Pseudo-real-time revision handling for cumulative series
         if is_cumulative:
+            cases = _apply_pseudo_realtime_downward_correction(cases_raw)
+            deaths = _apply_pseudo_realtime_downward_correction(deaths_raw)
+            recovered = _apply_pseudo_realtime_downward_correction(recovered_raw) if recovered_raw is not None else None
+
+            # Daily incidence after retrospective correction
             cases_inc = np.diff(np.r_[0.0, cases])
             deaths_inc = np.diff(np.r_[0.0, deaths])
+            recovered_inc = np.diff(np.r_[0.0, recovered]) if recovered is not None else None
         else:
+            cases = cases_raw
+            deaths = deaths_raw
+            recovered = recovered_raw
             cases_inc = cases
             deaths_inc = deaths
+            recovered_inc = recovered
 
         for i, dt in enumerate(g[date_col]):
             row = {"date": pd.to_datetime(dt)}
@@ -1965,12 +1921,11 @@ def running_cfr_from_count_table(
                     row[c] = g[c].iloc[0]
 
             if "naive" in methods:
-                # row["naive"] = _extract_point_estimate(cfr_naive(deaths[i], cases[i]))
                 est, lo, hi = _unpack_est_ci(cfr_naive(deaths[i], cases[i]))
                 row["naive"] = est
                 row["naive_lower"] = lo
                 row["naive_upper"] = hi
-                # row["naive"] = deaths / cases if cases > 0 else np.nan                
+
             if "resolved" in methods:
                 if recovered is None:
                     row["resolved"] = np.nan
@@ -1979,19 +1934,22 @@ def running_cfr_from_count_table(
                     row["resolved"] = est
                     row["resolved_lower"] = lo
                     row["resolved_upper"] = hi
-                    # row["resolved"] = _extract_point_estimate(cfr_resolved_cohort(deaths[i], recovered[i]))
+
             if "delay_adjusted" in methods:
                 if delay_distribution is None:
                     row["delay_adjusted"] = np.nan
                 else:
-                    est, lo, hi = _unpack_est_ci(cfr_delay_adjusted_nishiura(
-                        deaths=deaths_inc[: i + 1],
-                        cases=cases_inc[: i + 1],
-                        delay_distribution=delay_distribution,
-                    ))
+                    est, lo, hi = _unpack_est_ci(
+                        cfr_delay_adjusted_nishiura(
+                            deaths=deaths_inc[: i + 1],
+                            cases=cases_inc[: i + 1],
+                            delay_distribution=delay_distribution,
+                        )
+                    )
                     row["delay_adjusted"] = est
                     row["delay_adjusted_lower"] = lo
                     row["delay_adjusted_upper"] = hi
+
             rows.append(row)
 
     return pd.DataFrame(rows)
@@ -2064,32 +2022,49 @@ def running_cfr_from_line_list(
                 # denom = deaths + recovered
                 # row["resolved"] = deaths / denom if denom > 0 else np.nan
             if "delay_adjusted" in methods:
-                if delay_distribution_death is None:
+                if observed_start.empty or pd.isna(observed_start["start_date"].min()):
                     row["delay_adjusted"] = np.nan
                 else:
-                    if observed_start.empty or pd.isna(observed_start["start_date"].min()):
+                    # Build daily incidence by start date and daily death incidence by outcome date.
+                    cohort_dates = pd.date_range(observed_start["start_date"].min(), cutoff, freq="D")
+                    cases_daily = (
+                        observed_start.groupby("start_date").size().reindex(cohort_dates, fill_value=0).to_numpy(dtype=float)
+                    )
+                    deaths_daily = (
+                        observed_start.loc[
+                            (observed_start["event"] == death_label)
+                            & (observed_start["outcome_date"].notna())
+                            & (observed_start["outcome_date"] <= cutoff)
+                        ]
+                        .groupby("outcome_date")
+                        .size()
+                        .reindex(cohort_dates, fill_value=0)
+                        .to_numpy(dtype=float)
+                    )
+
+                    delay_dist_for_day = delay_distribution_death
+                    if delay_dist_for_day is None:
+                        try:
+                            delay_dist_for_day = _estimate_delay_distribution_for_analysis_date(
+                                linelist,
+                                analysis_date=cutoff,
+                                onset_col="start_date",
+                                outcome_date_col="outcome_date",
+                                outcome_col="event",
+                                death_label=death_label,
+                                recovery_label=recovery_label,
+                                dayfirst=dayfirst,
+                            )[death_label]["cdf"]
+                        except Exception:
+                            delay_dist_for_day = None
+
+                    if delay_dist_for_day is None:
                         row["delay_adjusted"] = np.nan
                     else:
-                        # Build daily incidence by start date and daily death incidence by outcome date.
-                        cohort_dates = pd.date_range(observed_start["start_date"].min(), cutoff, freq="D")
-                        cases_daily = (
-                            observed_start.groupby("start_date").size().reindex(cohort_dates, fill_value=0).to_numpy(dtype=float)
-                        )
-                        deaths_daily = (
-                            observed_start.loc[
-                                (observed_start["event"] == death_label)
-                                & (observed_start["outcome_date"].notna())
-                                & (observed_start["outcome_date"] <= cutoff)
-                            ]
-                            .groupby("outcome_date")
-                            .size()
-                            .reindex(cohort_dates, fill_value=0)
-                            .to_numpy(dtype=float)
-                        )
                         est, lo, hi = _unpack_est_ci(cfr_delay_adjusted_nishiura(
                             deaths=deaths_daily,
                             cases=cases_daily,
-                            delay_distribution=delay_distribution_death,
+                            delay_distribution=delay_dist_for_day,
                         ))
                         row["delay_adjusted"] = est
                         row["delay_adjusted_lower"] = lo
@@ -2224,8 +2199,6 @@ __all__ = [
     "load_drc_total",
     "load_rosello2015",
     "load_uganda_2022",
-    "load_sierra_leone_confirmed",
-    "load_sierra_leone_suspected",
     "standardize_count_table",
     "standardize_line_list",
     "estimate_delay_distributions_from_individual_data",
@@ -2245,7 +2218,6 @@ __all__ = [
     "adapt_drc_consolidated_to_counts",
     "adapt_rosello_to_linelist",
     "adapt_uganda_to_linelist",
-    "adapt_sierra_leone_to_linelist",
 ]
 
 
@@ -2474,7 +2446,3 @@ def adapt_uganda_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
     return work
 
 
-def adapt_sierra_leone_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
-    work = df.copy()
-    start = _to_datetime(work.get("Date of symptom onset "), dayfirst=True)
-    return pd.DataFrame({"start_date": start, "outcome_date": pd.NaT, "event": "censored"})

@@ -27,13 +27,21 @@ def plot_method_with_ci(ax, data, method, *, alpha=0.18, linewidth=2, label=None
                 data.loc[mask, "date"],
                 data.loc[mask, lo_col],
                 data.loc[mask, hi_col],
-                color=line.get_color(),
+                color=color,
                 alpha=alpha,
                 linewidth=0,
             )
 
     return line
 
+METHOD_COLORS = {
+    "naive": "#1f77b4",
+    "resolved": "#ff7f0e",
+    "delay_adjusted": "#2ca02c",
+    "competing_risks": "#d62728",
+    "kaplan_meier_ghani": "#9467bd",
+    "parametric_mixture": "#8c564b",
+}
 
 
 # DRC 2018 
@@ -114,12 +122,13 @@ plt.figure(figsize=(10, 6))
 
 for method in ["naive", "resolved", "delay_adjusted"]:
     if method in plot_results.columns:
-
+        color = METHOD_COLORS[method]
         line, = plt.plot(
             plot_results["date"],
             plot_results[method],
             linewidth=2,
             label=method,
+            color = color,
         )
 
         lower = f"{method}_lower"
@@ -130,7 +139,7 @@ for method in ["naive", "resolved", "delay_adjusted"]:
                 plot_results["date"],
                 plot_results[lower],
                 plot_results[upper],
-                color=line.get_color(),
+                color=color,
                 alpha=0.2,
             )
 
@@ -235,12 +244,13 @@ methods = [
 
 for method in methods:
     if method in plot_results.columns:
-
+        color = METHOD_COLORS[method]
         line, = plt.plot(
             plot_results["date"],
             plot_results[method],
             linewidth=2,
             label=method,
+            color=color,
         )
 
         lower = f"{method}_lower"
@@ -251,7 +261,7 @@ for method in methods:
                 plot_results["date"],
                 plot_results[lower],
                 plot_results[upper],
-                color=line.get_color(),
+                color=color,
                 alpha=0.2,
             )
 
@@ -328,15 +338,26 @@ for name, ll in linelists.items():
     recovery_delay = delays.get("recovery", {}).get("cdf")
     shape_death = delays["death"]["shape"]
     scale_death = delays["death"]["scale"]
+    mean_death = shape_death*scale_death
     shape_recovery = delays.get("recovery", {}).get("shape")
     scale_recovery = delays.get("recovery", {}).get("scale")
-    print(f"delay distribution death is Gamma {shape_death}, {scale_death}")
-    print(f"delay distribution recovery is Gamma {shape_recovery}, {scale_recovery}")
-    # Run CFR estimators
+    if shape_recovery is None:
+        mean_recovery = None
+    else:
+        mean_recovery = shape_recovery*scale_recovery
+    print(f"delay distribution death is Gamma {shape_death}, {scale_death},{mean_death}")
+    print(f"delay distribution recovery is Gamma {shape_recovery}, {scale_recovery},{mean_recovery}")
+    
+    if name in ["Mweka2007","Boende","Mweka2008"]:
+        methods_here = ["naive","delay_adjusted","competing_risks"]
+    else:
+        methods_here = methods
+
+    # Run CFR estimators    
     results = running_cfr(
         ll,
         dataset_kind="line_list",
-        methods=methods,
+        methods=methods_here,
         delay_distribution_death=death_delay,
         delay_distribution_recovery=recovery_delay,
         dayfirst=True,
@@ -370,7 +391,7 @@ for name, ll in linelists.items():
         results.loc[~results["has_recovery_data"], "resolved"] = np.nan
 
     # Start plotting from one week after first observation
-    start_date = results["date"].min() + pd.Timedelta(days=7)
+    start_date = results["date"].min() + pd.Timedelta(days=0)
     plot_results = results[results["date"] >= start_date].copy()
 
     # Mask failed mixture fits
@@ -385,12 +406,13 @@ for name, ll in linelists.items():
 
     for method in methods:
         if method in plot_results.columns:
-
+            color = METHOD_COLORS[method]
             line, = plt.plot(
                 plot_results["date"],
                 plot_results[method],
                 linewidth=2,
                 label=method,
+                color=color,
             )
 
             lower = f"{method}_lower"
@@ -401,7 +423,7 @@ for name, ll in linelists.items():
                     plot_results["date"],
                     plot_results[lower],
                     plot_results[upper],
-                    color=line.get_color(),
+                    color=color,
                     alpha=0.2,
                 )
 
@@ -488,12 +510,13 @@ plt.figure(figsize=(10, 6))
 
 for method in ["naive", "resolved", "delay_adjusted"]:
     if method in plot_results.columns:
-
+        color = METHOD_COLORS[method]
         line, = plt.plot(
             plot_results["date"],
             plot_results[method],
             linewidth=2,
             label=method,
+            color=color,
         )
 
         lower = f"{method}_lower"
@@ -504,7 +527,7 @@ for method in ["naive", "resolved", "delay_adjusted"]:
                 plot_results["date"],
                 plot_results[lower],
                 plot_results[upper],
-                color=line.get_color(),
+                color=color,
                 alpha=0.2,
             )
 
