@@ -296,7 +296,12 @@ def load_uganda_2022(path: Union[str, Path]) -> pd.DataFrame:
             df[c] = _to_datetime(df[c])
     return df
 
-
+def load_kenema_2014(path: Union[str, Path]) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    for c in ["Date of admission", "Date of discharge"]:
+        if c in df.columns:
+            df[c] = _to_datetime(df[c])
+    return df
 
 # ---------------------------------------------------------------------------
 # Standardization helpers for count tables and line lists
@@ -1990,7 +1995,14 @@ def running_cfr_from_line_list(
         methods = ["naive", "resolved", "delay_adjusted", "competing_risks", "kaplan_meier_ghani", "parametric_mixture"]
     methods = list(methods)
 
-    dates = pd.DatetimeIndex(sorted(pd.unique(linelist["start_date"].dropna())))
+    # Evaluate on every calendar day, not just days with new starts.
+    start_date = pd.to_datetime(linelist["start_date"].min()).normalize()
+
+    end_candidates = [linelist["start_date"].max(), linelist["outcome_date"].max()]
+    end_candidates = [pd.to_datetime(d).normalize() for d in end_candidates if pd.notna(d)]
+    end_date = max(end_candidates) if end_candidates else start_date
+
+    dates = pd.date_range(start=start_date, end=end_date, freq="D")
     rows = []
     for cutoff in dates:
         current = _prepare_individual_time_data(
@@ -2424,7 +2436,7 @@ def adapt_uganda_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
     work["analysis_origin_date"] = _to_datetime(work["Date_onset"], dayfirst=False)
     fallback = work["analysis_origin_date"].copy()
-    for c in ["Date_of_first_consult", "Date_confirmation", "Date_hospitalisation", "Date_isolation"]:
+    for c in ["Date_confirmation", "Date_hospitalisation", "Date_isolation"]:
         if c in work.columns:
             fallback = fallback.fillna(_to_datetime(work[c], dayfirst=False))
     outcome = work["Outcome"].map(_safe_lower)
@@ -2446,3 +2458,22 @@ def adapt_uganda_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
     return work
 
 
+def adapt_kenema_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.copy()
+    work["analysis_origin_date"] = _to_datetime(work["Date of admission"], dayfirst=False)
+    fallback = work["analysis_origin_date"].copy()
+    outcome = work["Outcome"].map(_safe_lower)
+    event = pd.Series(
+        np.where(
+            outcome.isin({"died"}),
+            "death",
+            np.where(outcome.isin({"discharged"}), "recovery", "censored"),
+        ),
+        index=work.index,
+    )
+    outcome_date = pd.Series(pd.NaT, index=work.index, dtype="datetime64[ns]")
+    if "Date of discharge" in work.columns:
+        outcome_date = outcome_date.fillna(_to_datetime(work["Date of discharge"], dayfirst=False))
+    work = pd.DataFrame({"start_date": fallback, "outcome_date": outcome_date, "event": event})
+    work = work.dropna(subset=["start_date"]).copy()
+    return work

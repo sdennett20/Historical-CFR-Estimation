@@ -7,6 +7,7 @@ import matplotlib.colors as mcolors
 
 # helper for plotting 
 def plot_method_with_ci(ax, data, method, *, alpha=0.18, linewidth=2, label=None):
+    color = METHOD_COLORS[method]
     y = data[method]
     lo_col = f"{method}_lower"
     hi_col = f"{method}_upper"
@@ -220,7 +221,7 @@ if len(recovery_dates) > 0:
     results.loc[~results["has_recovery_data"], "resolved"] = np.nan
 
 # Only keep data from one week after the first observation
-start_date = results["date"].min() + pd.Timedelta(days=7)
+start_date = results["date"].min() + pd.Timedelta(days=0)
 plot_results = results[results["date"] >= start_date]
 if "parametric_mixture_success" in plot_results.columns:
     plot_results.loc[
@@ -277,6 +278,129 @@ plt.close()
 
 print("Results written to: cfr_results_uganda.csv")
 print("Figure written to: cfr_results_uganda.png")
+
+# Kenema 2014
+
+from cfr_exact import (
+    load_kenema_2014,
+    adapt_kenema_to_linelist,
+    estimate_delay_distributions_from_individual_data,
+    running_cfr,
+)
+
+df = load_kenema_2014("Data/kenema_2014_ebola-data.csv")
+ll = adapt_kenema_to_linelist(df)
+
+print(ll["event"].value_counts(dropna=False))
+print(ll[["start_date", "outcome_date", "event"]].head())
+
+delays = estimate_delay_distributions_from_individual_data(
+    ll,
+    onset_col="start_date",
+    outcome_date_col="outcome_date",
+    outcome_col="event",
+    dayfirst=False,
+)
+
+death_delay = delays["death"]["cdf"]
+recovery_delay = delays.get("recovery",{}).get("cdf")
+
+results = running_cfr(
+    ll,
+    dataset_kind="line_list",
+    methods=["naive", "resolved", "delay_adjusted", "competing_risks", "kaplan_meier_ghani", "parametric_mixture"],
+    delay_distribution_death=death_delay,
+    delay_distribution_recovery=recovery_delay,
+    dayfirst=False,
+)
+
+print(results.head())
+
+# plot
+# Convert date column for plotting
+results["date"] = pd.to_datetime(results["date"])
+results = results.sort_values("date").reset_index(drop=True)
+
+# Only plot resolved after the first recovery has been observed
+recovery_dates = (
+    ll.loc[
+        (ll["event"] == "recovery") & ll["outcome_date"].notna(),
+        "outcome_date",
+    ]
+    .sort_values()
+    .to_numpy(dtype="datetime64[ns]")
+)
+
+if len(recovery_dates) > 0:
+    results["has_recovery_data"] = (
+        np.searchsorted(
+            recovery_dates,
+            results["date"].to_numpy(dtype="datetime64[ns]"),
+            side="right",
+        ) > 0
+    )
+    results.loc[~results["has_recovery_data"], "resolved"] = np.nan
+
+# Only keep data from one week after the first observation
+start_date = results["date"].min() + pd.Timedelta(days=0)
+plot_results = results[results["date"] >= start_date]
+if "parametric_mixture_success" in plot_results.columns:
+    plot_results.loc[
+        ~plot_results["parametric_mixture_success"],
+        "parametric_mixture",
+    ] = np.nan
+# Save results
+results.to_csv("Results/cfr_results_kenema.csv", index=False)
+
+# Plot all methods that are present
+plt.figure(figsize=(10, 6))
+
+methods = [
+    "naive",
+    "resolved",
+    "delay_adjusted",
+    "competing_risks",
+    "kaplan_meier_ghani",
+    "parametric_mixture",
+]
+
+for method in methods:
+    if method in plot_results.columns:
+        color = METHOD_COLORS[method]
+        line, = plt.plot(
+            plot_results["date"],
+            plot_results[method],
+            linewidth=2,
+            label=method,
+            color=color,
+        )
+
+        lower = f"{method}_lower"
+        upper = f"{method}_upper"
+
+        if lower in plot_results.columns and upper in plot_results.columns:
+            plt.fill_between(
+                plot_results["date"],
+                plot_results[lower],
+                plot_results[upper],
+                color=color,
+                alpha=0.2,
+            )
+
+plt.xlabel("Date")
+plt.ylabel("Case Fatality Ratio")
+plt.title("Running CFR Estimates")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+
+plt.savefig("Results/cfr_results_kenema.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+print("Results written to: cfr_results_kenema.csv")
+print("Figure written to: cfr_results_kenema.png")
+
+
 
 # Rosello
 from cfr_exact import adapt_rosello_to_linelist_by_outbreak
