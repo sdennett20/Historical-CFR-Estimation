@@ -1867,27 +1867,27 @@ def running_cfr_from_count_table(
     group_cols = [c for c in (group_cols or []) if c in work.columns]
     rows = []
 
-    def _apply_pseudo_realtime_downward_correction(series: np.ndarray) -> np.ndarray:
+    def _apply_pseudo_realtime_downward_correction(series: np.ndarray, current_idx: int) -> None:
         """
-        Retroactively cap earlier cumulative values whenever a later lower value appears.
-        This preserves the pseudo-real-time logic: once a revision is observed, all prior
-        days are revised downward to the minimum seen so far.
+        Apply a downward revision at the current row only to the historical values
+        used for current-and-future estimates.
+
+        This keeps already-emitted CFR rows unchanged, while ensuring the working
+        cumulative history remains consistent from the revision date onward.
         """
-        arr = np.asarray(series, dtype=float).copy()
-        if arr.size == 0:
-            return arr
+        if current_idx <= 0:
+            return
 
-        last_seen = np.nan
-        for i in range(arr.size):
-            if not np.isfinite(arr[i]):
-                continue
+        current = series[current_idx]
+        prev = series[current_idx - 1]
+        if not np.isfinite(current) or not np.isfinite(prev) or current >= prev:
+            return
 
-            if np.isfinite(last_seen) and arr[i] < last_seen:
-                arr[:i] = np.where(np.isfinite(arr[:i]), np.minimum(arr[:i], arr[i]), arr[:i])
-
-            last_seen = arr[i]
-
-        return arr
+        series[:current_idx] = np.where(
+            np.isfinite(series[:current_idx]),
+            np.minimum(series[:current_idx], current),
+            series[:current_idx],
+        )
 
     group_iter = [(None, work)] if not group_cols else list(work.groupby(group_cols, dropna=False, sort=False))
 
@@ -1901,25 +1901,20 @@ def running_cfr_from_count_table(
         if recovered_col and recovered_col in g.columns:
             recovered_raw = g[recovered_col].ffill().fillna(0.0).to_numpy(dtype=float) if is_cumulative else g[recovered_col].fillna(0.0).to_numpy(dtype=float)
 
-        # Pseudo-real-time revision handling for cumulative series
-        if is_cumulative:
-            cases = _apply_pseudo_realtime_downward_correction(cases_raw)
-            deaths = _apply_pseudo_realtime_downward_correction(deaths_raw)
-            recovered = _apply_pseudo_realtime_downward_correction(recovered_raw) if recovered_raw is not None else None
-
-            # Daily incidence after retrospective correction
-            cases_inc = np.diff(np.r_[0.0, cases])
-            deaths_inc = np.diff(np.r_[0.0, deaths])
-            recovered_inc = np.diff(np.r_[0.0, recovered]) if recovered is not None else None
-        else:
-            cases = cases_raw
-            deaths = deaths_raw
-            recovered = recovered_raw
-            cases_inc = cases
-            deaths_inc = deaths
-            recovered_inc = recovered
+        # Working copies for pseudo-real-time revision handling.
+        # Earlier emitted rows stay unchanged; only the current row and later rows
+        # use the revised historical series.
+        cases = cases_raw.copy()
+        deaths = deaths_raw.copy()
+        recovered = recovered_raw.copy() if recovered_raw is not None else None
 
         for i, dt in enumerate(g[date_col]):
+            if is_cumulative:
+                _apply_pseudo_realtime_downward_correction(cases, i)
+                _apply_pseudo_realtime_downward_correction(deaths, i)
+                if recovered is not None:
+                    _apply_pseudo_realtime_downward_correction(recovered, i)
+
             row = {"date": pd.to_datetime(dt)}
             if group_cols:
                 for c in group_cols:
@@ -1944,10 +1939,13 @@ def running_cfr_from_count_table(
                 if delay_distribution is None:
                     row["delay_adjusted"] = np.nan
                 else:
+                    cases_inc = np.diff(np.r_[0.0, cases[: i + 1]])
+                    deaths_inc = np.diff(np.r_[0.0, deaths[: i + 1]])
+                    recovered_inc = np.diff(np.r_[0.0, recovered[: i + 1]]) if recovered is not None else None
                     est, lo, hi = _unpack_est_ci(
                         cfr_delay_adjusted_nishiura(
-                            deaths=deaths_inc[: i + 1],
-                            cases=cases_inc[: i + 1],
+                            deaths=deaths_inc,
+                            cases=cases_inc,
                             delay_distribution=delay_distribution,
                         )
                     )
