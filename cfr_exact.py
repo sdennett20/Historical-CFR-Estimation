@@ -70,12 +70,6 @@ def _safe_lower(value: Any) -> str:
     return str(value).strip().lower()
 
 
-def _ensure_sorted_unique_dates(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
-    out = df.copy()
-    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
-    out = out.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
-    return out
-
 
 def _daily_complete_dates(df: pd.DataFrame, date_col: str, start: Optional[pd.Timestamp] = None,
                           end: Optional[pd.Timestamp] = None) -> pd.DatetimeIndex:
@@ -235,13 +229,6 @@ def _outcome_date_from_line_list(
         event = pd.Series(np.where(death_mask, death_label, np.where(rec_mask, recovery_label, "censored")), index=df.index)
 
     return event.astype(str), event_date
-
-
-def _analysis_origin_from_line_list_generic(
-    df: pd.DataFrame,
-    dayfirst: bool = True,
-) -> pd.Series:
-    return _analysis_origin_from_line_list(df, dayfirst=dayfirst)
 
 
 # ---------------------------------------------------------------------------
@@ -599,8 +586,6 @@ def cfr_resolved_cohort(deaths: Union[pd.Series, np.ndarray, float, int], recove
             "upper_ci": hi} if denom > 0 else np.nan
 
 
-
-
 def cfr_delay_adjusted_nishiura(
     deaths: Sequence[float],
     cases: Sequence[float],
@@ -658,8 +643,6 @@ def cfr_delay_adjusted_nishiura(
         poisson_threshold=poisson_threshold,
         p_mid=p_mid,
     )
-
-
 
 
 def _prepare_individual_time_data(
@@ -1146,62 +1129,6 @@ def cfr_ghani_2005_km(
         "n_recovered": int(np.sum(d_rec)),
         "ci_method": ci_method,
     }
-
-
-def cfr_ghani_2005_km1(
-    df: pd.DataFrame,
-    *,
-    time_col: str = "time",
-    event_col: str = "event",
-    death_label: str = "death",
-    recovery_label: str = "recovery",
-) -> float:
-    """
-    Ghani et al. (2005) adapted Kaplan-Meier CFR estimator.
-
-    Returns a scalar CFR estimate.
-    """
-    _require_columns(df, [time_col, event_col])
-
-    work = df[[time_col, event_col]].copy()
-    work[time_col] = _coerce_numeric(work[time_col])
-    work[event_col] = work[event_col].map(_safe_lower)
-    work = work.dropna(subset=[time_col]).copy()
-
-    if work.empty:
-        return np.nan
-
-    times = work[time_col].to_numpy(dtype=float)
-    events = work[event_col].to_numpy(dtype=str)
-
-    valid = np.isfinite(times)
-    times = times[valid]
-    events = events[valid]
-
-    event_times = np.unique(times[np.isin(events, [death_label, recovery_label])])
-    if event_times.size == 0:
-        return np.nan
-
-    s = 1.0          # composite survival Θ
-    theta0 = 0.0     # death probability contribution
-    theta1 = 0.0     # recovery probability contribution
-
-    for t in np.sort(event_times):
-        at_risk = np.sum(times >= t)
-        if at_risk <= 0:
-            continue
-
-        d_death = np.sum((times == t) & (events == death_label))
-        d_rec = np.sum((times == t) & (events == recovery_label))
-        d_all = d_death + d_rec
-
-        theta0 += s * (d_death / at_risk)
-        theta1 += s * (d_rec / at_risk)
-
-        s *= (1.0 - d_all / at_risk)
-
-    denom = theta0 + theta1
-    return float(theta0 / denom) if denom > 0 else np.nan
 
 
 def _mixture_negloglik(params: np.ndarray, times: np.ndarray, events: np.ndarray, family: str) -> float:
@@ -1959,8 +1886,6 @@ def running_cfr_from_count_table(
     return pd.DataFrame(rows)
 
 
-
-
 def running_cfr_from_line_list(
     df: pd.DataFrame,
     *,
@@ -2103,7 +2028,6 @@ def running_cfr_from_line_list(
     return pd.DataFrame(rows)
 
 
-
 def detect_dataset_kind(df: pd.DataFrame) -> str:
     cols = set(df.columns)
     count_signals = {"cases", "deaths", "report_date", "reference_date", "total_cases", "total_deaths"}
@@ -2236,8 +2160,8 @@ def adapt_drc_total_to_counts(df: pd.DataFrame) -> pd.DataFrame:
     return standardize_count_table(
         df,
         date_col="report_date",
-        cases_col="total_cases",
-        deaths_col="total_deaths",
+        cases_col="confirmed_cases",
+        deaths_col="confirmed_deaths",
         recovered_col="total_cured",
         is_cumulative=True,
     )
@@ -2380,30 +2304,73 @@ def adapt_drc_consolidated_to_counts1(df: pd.DataFrame) -> pd.DataFrame:
 def adapt_rosello_to_linelist(
     df: pd.DataFrame,
     start_date_col: str = "Date_of_onset_symp",
+    case_categories: list[str] | None = None,
 ) -> pd.DataFrame:
+
     work = df.copy()
+
+    # Restrict to requested case categories
+    if case_categories is not None:
+        if "Case_definition" not in work.columns:
+            raise ValueError(
+                "case_categories was supplied but 'Case_definition' "
+                "is not present in the Rosello dataset."
+            )
+
+        allowed = {
+            str(x).strip().lower()
+            for x in case_categories
+        }
+
+        status = (
+            work["Case_definition"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+
+        work = work.loc[status.isin(allowed)].copy()
+
     work["analysis_origin_date"] = _to_datetime(
-    work[start_date_col],
-    dayfirst=True,
-)
+        work[start_date_col],
+        dayfirst=True,
+    )
 
     outcome = work["Outcome"].map(_safe_lower)
+
     event = pd.Series(
         np.where(
             outcome.isin({"dead", "death"}),
             "death",
-            np.where(outcome.isin({"alive", "recovered", "discharged"}), "recovery", "censored"),
+            np.where(
+                outcome.isin({"alive", "recovered", "discharged"}),
+                "recovery",
+                "censored",
+            ),
         ),
         index=work.index,
     )
 
-    outcome_date = pd.Series(pd.NaT, index=work.index, dtype="datetime64[ns]")
+    outcome_date = pd.Series(
+        pd.NaT,
+        index=work.index,
+        dtype="datetime64[ns]",
+    )
+
     if "Date_of_Death" in work.columns:
-        outcome_date = outcome_date.fillna(_to_datetime(work["Date_of_Death"], dayfirst=True))
+        outcome_date = outcome_date.fillna(
+            _to_datetime(work["Date_of_Death"], dayfirst=True)
+        )
+
     if "Date_hospital_discharge" in work.columns:
-        outcome_date = outcome_date.fillna(_to_datetime(work["Date_hospital_discharge"], dayfirst=True))
+        outcome_date = outcome_date.fillna(
+            _to_datetime(work["Date_hospital_discharge"], dayfirst=True)
+        )
+
     if "Date_disease_ended" in work.columns:
-        outcome_date = outcome_date.fillna(_to_datetime(work["Date_disease_ended"], dayfirst=True))
+        outcome_date = outcome_date.fillna(
+            _to_datetime(work["Date_disease_ended"], dayfirst=True)
+        )
 
     work = pd.DataFrame(
         {
@@ -2412,48 +2379,119 @@ def adapt_rosello_to_linelist(
             "event": event,
         }
     )
+
     return work.dropna(subset=["start_date"]).copy()
-
-
 def adapt_rosello_to_linelist_by_outbreak(
     df: pd.DataFrame,
     outbreak_col: str = "Outbreak",
-) -> Dict[str, pd.DataFrame]:
+    case_categories_by_outbreak: dict[str, list[str]] | None = None,
+    start_date_col_by_outbreak: dict[str, str] | None = None,
+    default_start_date_col: str = "Date_of_onset_symp",
+) -> dict[str, pd.DataFrame]:
     if outbreak_col not in df.columns:
         raise ValueError(f"Missing required column: {outbreak_col}")
 
     out = {}
     for outbreak_value, group in df.groupby(outbreak_col, dropna=False):
         key = "missing" if pd.isna(outbreak_value) else str(outbreak_value)
-        ll = adapt_rosello_to_linelist(group).copy()
+
+        case_categories = None
+        if case_categories_by_outbreak is not None:
+            case_categories = case_categories_by_outbreak.get(key)
+
+        start_date_col = default_start_date_col
+        if start_date_col_by_outbreak is not None:
+            start_date_col = start_date_col_by_outbreak.get(key, default_start_date_col)
+
+        ll = adapt_rosello_to_linelist(
+            group,
+            start_date_col=start_date_col,
+            case_categories=case_categories,
+        ).copy()
+
         ll[outbreak_col] = outbreak_value
         out[key] = ll.reset_index(drop=True)
 
     return out
 
-def adapt_uganda_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
+def adapt_uganda_to_linelist(
+    df: pd.DataFrame,
+    confirmed_only: bool = True,
+) -> pd.DataFrame:
+
     work = df.copy()
-    work["analysis_origin_date"] = _to_datetime(work["Date_onset"], dayfirst=False)
+
+    # Restrict analysis to confirmed cases if requested
+    if confirmed_only:
+        if "Case_status" not in work.columns:
+            raise ValueError(
+                "confirmed_only=True but 'Case_status' is not present in the Uganda dataset."
+            )
+
+        work = work.loc[
+            work["Case_status"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .eq("confirmed")
+        ].copy()
+
+    work["analysis_origin_date"] = _to_datetime(
+        work["Date_onset"],
+        dayfirst=False
+    )
+
     fallback = work["analysis_origin_date"].copy()
+
     for c in ["Date_confirmation", "Date_hospitalisation", "Date_isolation"]:
         if c in work.columns:
-            fallback = fallback.fillna(_to_datetime(work[c], dayfirst=False))
+            fallback = fallback.fillna(
+                _to_datetime(work[c], dayfirst=False)
+            )
+
     outcome = work["Outcome"].map(_safe_lower)
+
     event = pd.Series(
         np.where(
             outcome.isin({"death", "dead", "died", "deceased"}),
             "death",
-            np.where(outcome.isin({"recovery", "recovered", "alive", "discharged"}), "recovery", "censored"),
+            np.where(
+                outcome.isin(
+                    {"recovery", "recovered", "alive", "discharged"}
+                ),
+                "recovery",
+                "censored",
+            ),
         ),
         index=work.index,
     )
-    outcome_date = pd.Series(pd.NaT, index=work.index, dtype="datetime64[ns]")
+
+    outcome_date = pd.Series(
+        pd.NaT,
+        index=work.index,
+        dtype="datetime64[ns]"
+    )
+
     if "Date_Death" in work.columns:
-        outcome_date = outcome_date.fillna(_to_datetime(work["Date_Death"], dayfirst=False))
+        outcome_date = outcome_date.fillna(
+            _to_datetime(work["Date_Death"], dayfirst=False)
+        )
+
     if "Date_Recovered" in work.columns:
-        outcome_date = outcome_date.fillna(_to_datetime(work["Date_Recovered"], dayfirst=False))
-    work = pd.DataFrame({"start_date": fallback, "outcome_date": outcome_date, "event": event})
+        outcome_date = outcome_date.fillna(
+            _to_datetime(work["Date_Recovered"], dayfirst=False)
+        )
+
+    work = pd.DataFrame(
+        {
+            "start_date": fallback,
+            "outcome_date": outcome_date,
+            "event": event,
+        }
+    )
+
     work = work.dropna(subset=["start_date"]).copy()
+
     return work
 
 
