@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
 import matplotlib.colors as mcolors
+from typing import Optional
 
 # helper for plotting 
 def plot_method_with_ci(ax, data, method, *, alpha=0.18, linewidth=2, label=None):
@@ -43,6 +44,238 @@ METHOD_COLORS = {
     "kaplan_meier_ghani": "#9467bd",
     "parametric_mixture": "#8c564b",
 }
+
+EPICURVE_COLORS = {
+    "cases": "#444444",
+    "deaths": "#d62728",
+    "recoveries": "#2ca02c",
+}
+methods = [
+    "naive",
+    "resolved",
+    "delay_adjusted",
+    "competing_risks",
+    "kaplan_meier_ghani",
+    "parametric_mixture",
+]
+
+def _prepare_count_table_epidemic_curve(
+    raw_df: pd.DataFrame,
+    *,
+    date_col: str,
+    cases_col: str,
+    deaths_col: str,
+    recovered_col: Optional[str] = None,
+) -> pd.DataFrame:
+    work = raw_df.copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+    work = work.dropna(subset=[date_col]).copy()
+    if work.empty:
+        return pd.DataFrame(columns=["date", "cases", "deaths", "recoveries"])
+
+    idx = pd.date_range(
+        start=work[date_col].min().normalize(),
+        end=work[date_col].max().normalize(),
+        freq="D",
+    )
+
+    def _series_for(col: Optional[str]) -> pd.Series:
+        if col is None or col not in work.columns:
+            return pd.Series(0.0, index=idx)
+        s = (
+            pd.to_numeric(work[col], errors="coerce")
+            .groupby(work[date_col].dt.normalize())
+            .last()
+            .reindex(idx)
+            .ffill()
+            .fillna(0.0)
+        )
+        return s.astype(float)
+
+    cases = _series_for(cases_col)
+    deaths = _series_for(deaths_col)
+    recoveries = _series_for(recovered_col)
+
+    return pd.DataFrame(
+        {
+            "date": idx,
+            "cases": cases.to_numpy(dtype=float),
+            "deaths": deaths.to_numpy(dtype=float),
+            "recoveries": recoveries.to_numpy(dtype=float),
+        }
+    )
+
+
+def _prepare_linelist_epidemic_curve(ll: pd.DataFrame) -> pd.DataFrame:
+    work = ll.copy()
+    work["start_date"] = pd.to_datetime(work["start_date"], errors="coerce")
+    work["outcome_date"] = pd.to_datetime(work["outcome_date"], errors="coerce")
+    if "event" in work.columns:
+        event = work["event"].astype(str).str.lower()
+    else:
+        event = pd.Series("", index=work.index, dtype="object")
+
+    start_candidates = [s.min() for s in [work["start_date"], work["outcome_date"]] if s.notna().any()]
+    end_candidates = [s.max() for s in [work["start_date"], work["outcome_date"]] if s.notna().any()]
+    if not start_candidates or not end_candidates:
+        return pd.DataFrame(columns=["date", "cases", "deaths", "recoveries"])
+
+    idx = pd.date_range(
+        start=pd.to_datetime(min(start_candidates)).normalize(),
+        end=pd.to_datetime(max(end_candidates)).normalize(),
+        freq="D",
+    )
+
+    cases_daily = (
+        work.loc[work["start_date"].notna(), "start_date"].dt.normalize().value_counts().sort_index().reindex(idx, fill_value=0).astype(float)
+    )
+    deaths_daily = (
+        work.loc[event.isin({"death", "dead", "died", "deceased"}) & work["outcome_date"].notna(), "outcome_date"]
+        .dt.normalize()
+        .value_counts()
+        .sort_index()
+        .reindex(idx, fill_value=0)
+        .astype(float)
+    )
+    recoveries_daily = (
+        work.loc[event.isin({"recovery", "recovered", "alive", "discharged", "discharge"}) & work["outcome_date"].notna(), "outcome_date"]
+        .dt.normalize()
+        .value_counts()
+        .sort_index()
+        .reindex(idx, fill_value=0)
+        .astype(float)
+    )
+
+    return pd.DataFrame(
+        {
+            "date": idx,
+            "cases": cases_daily.cumsum().to_numpy(dtype=float),
+            "deaths": deaths_daily.cumsum().to_numpy(dtype=float),
+            "recoveries": recoveries_daily.cumsum().to_numpy(dtype=float),
+        }
+    )
+
+
+def _plot_cfr_and_curve_figure(
+    *,
+    plot_results: pd.DataFrame,
+    epidemic_curve: pd.DataFrame,
+    methods: list[str],
+    title: str,
+    output_path: str,
+    include_recoveries: bool = True,
+) -> None:
+    fig, (ax_cfr, ax_curve) = plt.subplots(
+        2,
+        1,
+        figsize=(10, 8),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+
+    for method in methods:
+        if method in plot_results.columns:
+            color = METHOD_COLORS[method]
+            ax_cfr.plot(
+                plot_results["date"],
+                plot_results[method],
+                linewidth=2,
+                label=method,
+                color=color,
+            )
+            lower = f"{method}_lower"
+            upper = f"{method}_upper"
+            if lower in plot_results.columns and upper in plot_results.columns:
+                ax_cfr.fill_between(
+                    plot_results["date"],
+                    plot_results[lower],
+                    plot_results[upper],
+                    color=color,
+                    alpha=0.2,
+                )
+
+    if not epidemic_curve.empty:
+        ax_curve.plot(
+            epidemic_curve["date"],
+            epidemic_curve["cases"],
+            linewidth=2,
+            label="cases",
+            color=EPICURVE_COLORS["cases"],
+        )
+        ax_curve.plot(
+            epidemic_curve["date"],
+            epidemic_curve["deaths"],
+            linewidth=2,
+            label="deaths",
+            color=EPICURVE_COLORS["deaths"],
+        )
+        if include_recoveries and epidemic_curve["recoveries"].notna().any() and float(epidemic_curve["recoveries"].sum()) > 0:
+            ax_curve.plot(
+                epidemic_curve["date"],
+                epidemic_curve["recoveries"],
+                linewidth=2,
+                label="recoveries",
+                color=EPICURVE_COLORS["recoveries"],
+            )
+
+    ax_cfr.set_ylabel("Case Fatality Ratio")
+    ax_cfr.set_title(title)
+    ax_cfr.legend()
+    ax_cfr.grid(True, alpha=0.3)
+
+    ax_curve.set_xlabel("Date")
+    ax_curve.set_ylabel("Cumulative count")
+    ax_curve.set_title("Cumulative epidemic curve")
+    ax_curve.legend(ncol=3)
+    ax_curve.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _prepare_linelist_epidemic_curve(ll: pd.DataFrame) -> pd.DataFrame:
+    work = ll.copy()
+    work["start_date"] = pd.to_datetime(work["start_date"], errors="coerce")
+    work["outcome_date"] = pd.to_datetime(work["outcome_date"], errors="coerce")
+
+    start_candidates = [s.min() for s in [work["start_date"], work["outcome_date"]] if s.notna().any()]
+    end_candidates = [s.max() for s in [work["start_date"], work["outcome_date"]] if s.notna().any()]
+    if not start_candidates or not end_candidates:
+        return pd.DataFrame(columns=["date", "cases", "deaths", "recoveries"])
+
+    idx = pd.date_range(start=pd.to_datetime(min(start_candidates)).normalize(), end=pd.to_datetime(max(end_candidates)).normalize(), freq="D")
+
+    cases_daily = (
+        work.loc[work["start_date"].notna(), "start_date"].dt.normalize().value_counts().sort_index().reindex(idx, fill_value=0).astype(float)
+    )
+    deaths_daily = (
+        work.loc[work["event"].astype(str).str.lower().isin({"death", "dead", "died", "deceased"}) & work["outcome_date"].notna(), "outcome_date"]
+        .dt.normalize()
+        .value_counts()
+        .sort_index()
+        .reindex(idx, fill_value=0)
+        .astype(float)
+    )
+    recoveries_daily = (
+        work.loc[work["event"].astype(str).str.lower().isin({"recovery", "recovered", "alive", "discharged", "discharge"}) & work["outcome_date"].notna(), "outcome_date"]
+        .dt.normalize()
+        .value_counts()
+        .sort_index()
+        .reindex(idx, fill_value=0)
+        .astype(float)
+    )
+
+    cases = cases_daily.cumsum()
+    deaths = deaths_daily.cumsum()
+    recoveries = recoveries_daily.cumsum()
+
+    return pd.DataFrame({
+        "date": idx,
+        "cases": cases.to_numpy(dtype=float),
+        "deaths": deaths.to_numpy(dtype=float),
+        "recoveries": recoveries.to_numpy(dtype=float),
+    })
 
 
 # DRC 2018 
@@ -114,45 +347,25 @@ results["has_recovery_data"] = (
 mask = ~results["has_recovery_data"]
 results.loc[mask, ["resolved", "resolved_lower", "resolved_upper"]] = np.nan
 
-# Only keep data from one week after the first observation
+# Can change start date here
 start_date = results["date"].min() + pd.Timedelta(days=0)
-plot_results = results[results["date"] >= start_date]
+plot_results = results[results["date"] >= start_date].copy()
 
-# Create the figure
-plt.figure(figsize=(10, 6))
+epidemic_curve = _prepare_count_table_epidemic_curve(
+    df,
+    date_col="report_date",
+    cases_col="total_cases",
+    deaths_col="total_deaths",
+    recovered_col="total_cured",
+)
 
-for method in ["naive", "resolved", "delay_adjusted"]:
-    if method in plot_results.columns:
-        color = METHOD_COLORS[method]
-        line, = plt.plot(
-            plot_results["date"],
-            plot_results[method],
-            linewidth=2,
-            label=method,
-            color = color,
-        )
-
-        lower = f"{method}_lower"
-        upper = f"{method}_upper"
-
-        if lower in plot_results.columns and upper in plot_results.columns:
-            plt.fill_between(
-                plot_results["date"],
-                plot_results[lower],
-                plot_results[upper],
-                color=color,
-                alpha=0.2,
-            )
-
-plt.xlabel("Date")
-plt.ylabel("Case Fatality Ratio")
-plt.title("Running CFR Estimates")
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-
-plt.savefig("Results/cfr_results_2018.png", dpi=300, bbox_inches="tight")
-
+_plot_cfr_and_curve_figure(
+    plot_results=plot_results,
+    epidemic_curve=epidemic_curve,
+    methods=["naive", "resolved", "delay_adjusted"],
+    title="Running CFR Estimates - DRC 2018",
+    output_path="Results/cfr_results_2018.png",
+)
 
 print("Results written to: cfr_results_2018.csv")
 print("Figure written to: cfr_results_2018.png")
@@ -220,9 +433,9 @@ if len(recovery_dates) > 0:
     )
     results.loc[~results["has_recovery_data"], "resolved"] = np.nan
 
-# Only keep data from one week after the first observation
+# Can change start date here
 start_date = results["date"].min() + pd.Timedelta(days=0)
-plot_results = results[results["date"] >= start_date]
+plot_results = results[results["date"] >= start_date].copy()
 if "parametric_mixture_success" in plot_results.columns:
     plot_results.loc[
         ~plot_results["parametric_mixture_success"],
@@ -231,50 +444,15 @@ if "parametric_mixture_success" in plot_results.columns:
 # Save results
 results.to_csv("Results/cfr_results_uganda.csv", index=False)
 
-# Plot all methods that are present
-plt.figure(figsize=(10, 6))
+epidemic_curve = _prepare_linelist_epidemic_curve(ll)
 
-methods = [
-    "naive",
-    "resolved",
-    "delay_adjusted",
-    "competing_risks",
-    "kaplan_meier_ghani",
-    "parametric_mixture",
-]
-
-for method in methods:
-    if method in plot_results.columns:
-        color = METHOD_COLORS[method]
-        line, = plt.plot(
-            plot_results["date"],
-            plot_results[method],
-            linewidth=2,
-            label=method,
-            color=color,
-        )
-
-        lower = f"{method}_lower"
-        upper = f"{method}_upper"
-
-        if lower in plot_results.columns and upper in plot_results.columns:
-            plt.fill_between(
-                plot_results["date"],
-                plot_results[lower],
-                plot_results[upper],
-                color=color,
-                alpha=0.2,
-            )
-
-plt.xlabel("Date")
-plt.ylabel("Case Fatality Ratio")
-plt.title("Running CFR Estimates")
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-
-plt.savefig("Results/cfr_results_uganda.png", dpi=300, bbox_inches="tight")
-plt.close()
+_plot_cfr_and_curve_figure(
+    plot_results=plot_results,
+    epidemic_curve=epidemic_curve,
+    methods=methods,
+    title="Running CFR Estimates - Uganda 2022",
+    output_path="Results/cfr_results_uganda.png",
+)
 
 print("Results written to: cfr_results_uganda.csv")
 print("Figure written to: cfr_results_uganda.png")
@@ -341,9 +519,9 @@ if len(recovery_dates) > 0:
     )
     results.loc[~results["has_recovery_data"], "resolved"] = np.nan
 
-# Only keep data from one week after the first observation
+# Can change start date here
 start_date = results["date"].min() + pd.Timedelta(days=0)
-plot_results = results[results["date"] >= start_date]
+plot_results = results[results["date"] >= start_date].copy()
 if "parametric_mixture_success" in plot_results.columns:
     plot_results.loc[
         ~plot_results["parametric_mixture_success"],
@@ -352,50 +530,15 @@ if "parametric_mixture_success" in plot_results.columns:
 # Save results
 results.to_csv("Results/cfr_results_kenema.csv", index=False)
 
-# Plot all methods that are present
-plt.figure(figsize=(10, 6))
+epidemic_curve = _prepare_linelist_epidemic_curve(ll)
 
-methods = [
-    "naive",
-    "resolved",
-    "delay_adjusted",
-    "competing_risks",
-    "kaplan_meier_ghani",
-    "parametric_mixture",
-]
-
-for method in methods:
-    if method in plot_results.columns:
-        color = METHOD_COLORS[method]
-        line, = plt.plot(
-            plot_results["date"],
-            plot_results[method],
-            linewidth=2,
-            label=method,
-            color=color,
-        )
-
-        lower = f"{method}_lower"
-        upper = f"{method}_upper"
-
-        if lower in plot_results.columns and upper in plot_results.columns:
-            plt.fill_between(
-                plot_results["date"],
-                plot_results[lower],
-                plot_results[upper],
-                color=color,
-                alpha=0.2,
-            )
-
-plt.xlabel("Date")
-plt.ylabel("Case Fatality Ratio")
-plt.title("Running CFR Estimates")
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-
-plt.savefig("Results/cfr_results_kenema.png", dpi=300, bbox_inches="tight")
-plt.close()
+_plot_cfr_and_curve_figure(
+    plot_results=plot_results,
+    epidemic_curve=epidemic_curve,
+    methods=methods,
+    title="Running CFR Estimates - Kenema 2014",
+    output_path="Results/cfr_results_kenema.png",
+)
 
 print("Results written to: cfr_results_kenema.csv")
 print("Figure written to: cfr_results_kenema.png")
@@ -404,6 +547,7 @@ print("Figure written to: cfr_results_kenema.png")
 
 # Rosello
 from cfr_exact import adapt_rosello_to_linelist_by_outbreak
+
 df = pd.read_csv("Data/rosello2015_supplementary1.csv")
 
 linelists = adapt_rosello_to_linelist_by_outbreak(df)
@@ -432,14 +576,7 @@ print(
 linelists["Mweka2007"].to_csv("Mweka2007_linelist.csv", index=False)
 linelists["Boende"].to_csv("Boende_linelist.csv", index=False)
 
-methods = [
-    "naive",
-    "resolved",
-    "delay_adjusted",
-    "competing_risks",
-    "kaplan_meier_ghani",
-    "parametric_mixture",
-]
+
 
 skip = {"Tandala"}
 
@@ -525,44 +662,18 @@ for name, ll in linelists.items():
             "parametric_mixture",
         ] = np.nan
 
-    # Plot
-    plt.figure(figsize=(10, 6))
+    epidemic_curve = _prepare_linelist_epidemic_curve(ll)
 
-    for method in methods:
-        if method in plot_results.columns:
-            color = METHOD_COLORS[method]
-            line, = plt.plot(
-                plot_results["date"],
-                plot_results[method],
-                linewidth=2,
-                label=method,
-                color=color,
-            )
+    _plot_cfr_and_curve_figure(
+        plot_results=plot_results,
+        epidemic_curve=epidemic_curve,
+        methods=methods,
+        title=f"Running CFR Estimates - {name}",
+        output_path=f"Results/cfr_results_{name}.png",
+    )
 
-            lower = f"{method}_lower"
-            upper = f"{method}_upper"
-
-            if lower in plot_results.columns and upper in plot_results.columns:
-                plt.fill_between(
-                    plot_results["date"],
-                    plot_results[lower],
-                    plot_results[upper],
-                    color=color,
-                    alpha=0.2,
-                )
-
-    plt.xlabel("Date")
-    plt.ylabel("Case Fatality Ratio")
-    plt.title("Running CFR Estimates")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(f"Results/cfr_results_{name}.png", dpi=300, bbox_inches="tight")
-    plt.close()
-
-    print(f"Results written to: cfr_results_{name}.csv")
-    print(f"Figure written to: cfr_results_{name}.png")
-
+    print(f"Results written to: Results/cfr_results_{name}.csv")
+    print(f"Figure written to: Results/cfr_results_{name}.png")
 
 # Current DRC outbreak 
 from cfr_exact import adapt_drc_consolidated_to_counts
@@ -625,45 +736,25 @@ results.loc[
     ["resolved", "resolved_lower", "resolved_upper"]
 ] = np.nan
 
-# Only keep data from one week after the first observation
+# Can change start date here
 start_date = results["date"].min() + pd.Timedelta(days=0)
-plot_results = results[results["date"] >= start_date]
+plot_results = results[results["date"] >= start_date].copy()
 
-# Create the figure
-plt.figure(figsize=(10, 6))
+epidemic_curve = _prepare_count_table_epidemic_curve(
+    counts,
+    date_col="report_date",
+    cases_col="total_cases",
+    deaths_col="total_deaths",
+    recovered_col="total_cured",
+)
 
-for method in ["naive", "resolved", "delay_adjusted"]:
-    if method in plot_results.columns:
-        color = METHOD_COLORS[method]
-        line, = plt.plot(
-            plot_results["date"],
-            plot_results[method],
-            linewidth=2,
-            label=method,
-            color=color,
-        )
-
-        lower = f"{method}_lower"
-        upper = f"{method}_upper"
-
-        if lower in plot_results.columns and upper in plot_results.columns:
-            plt.fill_between(
-                plot_results["date"],
-                plot_results[lower],
-                plot_results[upper],
-                color=color,
-                alpha=0.2,
-            )
-
-plt.xlabel("Date")
-plt.ylabel("Case Fatality Ratio")
-plt.title("Running CFR Estimates")
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-
-plt.savefig("Results/cfr_results_2026.png", dpi=300, bbox_inches="tight")
-
+_plot_cfr_and_curve_figure(
+    plot_results=plot_results,
+    epidemic_curve=epidemic_curve,
+    methods=["naive", "resolved", "delay_adjusted"],
+    title="Running CFR Estimates - DRC 2026",
+    output_path="Results/cfr_results_2026.png",
+)
 
 print("Results written to: cfr_results_2026.csv")
 print("Figure written to: cfr_results_2026.png")
@@ -726,7 +817,7 @@ results["has_recovery_data"] = (
 mask = ~results["has_recovery_data"]
 results.loc[mask, ["resolved", "resolved_lower", "resolved_upper"]] = np.nan
 
-# Only keep data from one week after the first observation
+# Can change start date here
 start_date = results["date"].min() + pd.Timedelta(days=0)
 plot_results = results[results["date"] >= start_date]
 
