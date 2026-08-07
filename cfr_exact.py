@@ -2477,3 +2477,13 @@ def adapt_kenema_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
     work = pd.DataFrame({"start_date": fallback, "outcome_date": outcome_date, "event": event})
     work = work.dropna(subset=["start_date"]).copy()
     return work
+
+def adapt_guinea_to_counts(df: pd.DataFrame) -> pd.DataFrame:
+    return standardize_count_table(
+        df,
+        date_col="Date_case",
+        cases_col="Cases",
+        deaths_col="Deaths",
+        recovered_col="Recoveries",
+        is_cumulative=True,
+    )
