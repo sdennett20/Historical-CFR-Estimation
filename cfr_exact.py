@@ -1882,10 +1882,11 @@ def running_cfr_from_count_table(
         prev = series[current_idx - 1]
         if not np.isfinite(current) or not np.isfinite(prev) or current >= prev:
             return
+        ratio = current/prev
 
         series[:current_idx] = np.where(
             np.isfinite(series[:current_idx]),
-            np.minimum(series[:current_idx], current),
+            np.rint(series[:current_idx]*ratio),
             series[:current_idx],
         )
 
