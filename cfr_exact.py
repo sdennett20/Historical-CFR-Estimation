@@ -29,10 +29,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import math
+import re
 import warnings
 
 import numpy as np
 import pandas as pd
+import patsy
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
 from scipy.special import expit, logit
 from scipy import stats
 from scipy.stats import beta, chi2, norm
@@ -49,6 +53,65 @@ def _to_datetime(series: pd.Series, dayfirst: bool = False) -> pd.Series:
 
 def _coerce_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
+
+
+_AGE_BAND_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*$")
+_AGE_OPEN_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*\+\s*$")
+
+
+def parse_age_bands(
+    series: pd.Series,
+    *,
+    method: str = "midpoint",
+    open_bin_width: float = 10.0,
+    rng: Optional[np.random.Generator] = None,
+) -> pd.Series:
+    """Convert age-band strings (e.g. "20-24", "80+") to a single numeric age.
+
+    method="midpoint" uses the bin midpoint. This is a standard, simple
+    approximation, but it treats an interval-censored age as if it were
+    known exactly, which understates uncertainty and can attenuate a fitted
+    age effect -- the wider/more inconsistent the bins, the bigger the
+    concern. Check that bin widths are actually consistent before trusting
+    this for a given dataset.
+
+    method="uniform_sample" instead draws one age uniformly at random within
+    each bin. It isn't better as a single call (one arbitrary draw vs. one
+    arbitrary midpoint), but is meant to be called once per replicate in a
+    multiple-imputation loop, so the within-bin uncertainty shows up as
+    extra spread across replicates rather than being silently discarded.
+
+    Entries that are already numeric, or don't match a "lo-hi"/"lo+"
+    pattern, are coerced with pandas.to_numeric, so a column mixing exact
+    ages and bands is handled sensibly.
+    """
+    if method not in {"midpoint", "uniform_sample"}:
+        raise ValueError(f"Unknown method: {method!r}")
+    if rng is None:
+        rng = np.random.default_rng()
+
+    def _parse_one(raw: Any) -> float:
+        if pd.isna(raw):
+            return np.nan
+        text = str(raw).strip()
+
+        m = _AGE_BAND_RE.match(text)
+        if m:
+            lo, hi = float(m.group(1)), float(m.group(2))
+            if method == "midpoint":
+                return (lo + hi) / 2.0
+            return float(rng.uniform(lo, hi + 1.0))  # bins are integer-inclusive
+
+        m = _AGE_OPEN_RE.match(text)
+        if m:
+            lo = float(m.group(1))
+            if method == "midpoint":
+                return lo + open_bin_width / 2.0
+            return float(rng.uniform(lo, lo + open_bin_width))
+
+        return pd.to_numeric(raw, errors="coerce")
+
+    return series.map(_parse_one).astype(float)
 
 
 def _require_columns(df: pd.DataFrame, cols: Sequence[str], *, label: str = "data") -> None:
@@ -379,16 +442,26 @@ def standardize_line_list(
     onset_col: Optional[str] = None,
     outcome_col: Optional[str] = None,
     outcome_date_col: Optional[str] = None,
+    age_col: Optional[str] = None,
     death_label: str = "death",
     recovery_label: str = "recovery",
     dayfirst: bool = True,
 ) -> pd.DataFrame:
-    """Return a standardized linelist with start_date, outcome_date, event."""
+    """Return a standardized linelist with start_date, outcome_date, event.
+
+    If `age_col` is given, or the input already has an `age`/`Age` column,
+    it is carried through as a numeric `age` column for use by the
+    age-specific estimators (cfr_naive_by_age, cfr_resolved_by_age).
+    """
     work = df.copy()
+
+    if age_col is None:
+        age_col = _first_existing_column(work, ["age", "Age"])
 
     # Already-standardized input
     if {"start_date", "outcome_date", "event"}.issubset(work.columns):
-        out = work[["start_date", "outcome_date", "event"]].copy()
+        cols = ["start_date", "outcome_date", "event"]
+        out = work[cols].copy()
         out["start_date"] = _to_datetime(out["start_date"], dayfirst=dayfirst)
         out["outcome_date"] = _to_datetime(out["outcome_date"], dayfirst=dayfirst)
         out["event"] = out["event"].map(_safe_lower)
@@ -397,6 +470,8 @@ def standardize_line_list(
         out.loc[death_mask, "event"] = death_label
         out.loc[rec_mask, "event"] = recovery_label
         out.loc[~(death_mask | rec_mask), "event"] = "censored"
+        if age_col is not None:
+            out["age"] = _coerce_numeric(work[age_col])
 
         # Exclude impossible records: outcome before onset
         valid_outcome = out["outcome_date"].isna() | (out["outcome_date"] >= out["start_date"])
@@ -446,6 +521,8 @@ def standardize_line_list(
             "event": event.astype(str),
         }
     )
+    if age_col is not None:
+        standardized["age"] = _coerce_numeric(work[age_col])
     standardized = standardized.dropna(subset=["start_date"]).copy()
 
     # normalize labels
@@ -581,9 +658,388 @@ def cfr_resolved_cohort(deaths: Union[pd.Series, np.ndarray, float, int], recove
     recovered = float(np.nansum(recovered))
     denom = deaths + recovered
     (lo,hi) = clopper_pearson_ci(deaths,denom)
-    return {"estimate": deaths / denom, 
+    return {"estimate": deaths / denom,
             "lower_ci":lo,
             "upper_ci": hi} if denom > 0 else np.nan
+
+
+# ---------------------------------------------------------------------------
+# Age-specific (continuous) naive and resolved-cohort CFR
+#
+# Individual-level counterparts of cfr_naive / cfr_resolved_cohort: instead
+# of a single pooled ratio, death is modelled as a logistic GAM with a
+# B-spline term on age, died ~ bs(age). This is the direct regression
+# analogue of the two pooled ratios (naive keeps every case in the
+# denominator, resolved restricts to cases with a known outcome), giving a
+# smooth CFR(age) curve and age-to-age odds ratios instead of a single
+# stratified estimate.
+# ---------------------------------------------------------------------------
+
+
+def _spline_logistic_fit(
+    data: pd.DataFrame,
+    age_col: str,
+    died_col: str,
+    *,
+    spline_df: int = 4,
+    degree: int = 3,
+    age_bounds: Optional[Tuple[float, float]] = None,
+):
+    """Fit died ~ bs(age) as a binomial GLM (a logistic GAM with a B-spline basis on age).
+
+    `age_bounds`, if given, fixes the spline's boundary knots instead of
+    deriving them from this fit's own data range. Needed whenever multiple
+    fits (e.g. successive time snapshots) must share one basis/domain so
+    they're comparable and so predictions at ages outside a given snapshot's
+    own observed range don't raise (patsy's bs() doesn't extrapolate past
+    its training knots by default).
+    """
+    n_unique_ages = data[age_col].nunique()
+    if n_unique_ages <= degree:
+        raise ValueError(
+            f"Only {n_unique_ages} distinct age value(s) available; need more than "
+            f"degree={degree} to fit a spline. Reduce spline_df/degree or supply more data."
+        )
+    bounds_arg = f", lower_bound={age_bounds[0]}, upper_bound={age_bounds[1]}" if age_bounds is not None else ""
+    formula = f"{died_col} ~ bs({age_col}, df={spline_df}, degree={degree}{bounds_arg})"
+    model = smf.glm(formula, data=data, family=sm.families.Binomial())
+    return model.fit()
+
+
+def _predict_cfr_curve(
+    fit,
+    age_grid: np.ndarray,
+    *,
+    age_col: str = "age",
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """Predicted CFR(age) curve with a Wald CI back-transformed from the linear predictor."""
+    new_data = pd.DataFrame({age_col: np.asarray(age_grid, dtype=float)})
+    summary = fit.get_prediction(new_data).summary_frame(alpha=alpha)
+    return pd.DataFrame(
+        {
+            "age": new_data[age_col].to_numpy(),
+            "estimate": summary["mean"].to_numpy(),
+            "lower_ci": summary["mean_ci_lower"].to_numpy(),
+            "upper_ci": summary["mean_ci_upper"].to_numpy(),
+        }
+    )
+
+
+def age_cfr_odds_ratio(
+    fit,
+    age1: float,
+    age2: float,
+    *,
+    age_col: str = "age",
+    alpha: float = 0.05,
+) -> Dict[str, float]:
+    """Odds ratio of death at age2 relative to age1, from a fitted age_cfr_by_age model.
+
+    Computed from the difference in the two ages' spline design rows rather
+    than from their marginal CIs, so the covariance between the two
+    predictions (they share the same spline basis/parameters) is accounted
+    for correctly.
+    """
+    design_info = fit.model.data.design_info
+    rows = np.asarray(patsy.build_design_matrices([design_info], {age_col: [age1, age2]})[0])
+    diff = rows[1] - rows[0]
+    params = np.asarray(fit.params)
+    cov = np.asarray(fit.cov_params())
+
+    log_or = float(diff @ params)
+    se = float(np.sqrt(diff @ cov @ diff.T))
+    z = norm.ppf(1 - alpha / 2)
+
+    return {
+        "age1": float(age1),
+        "age2": float(age2),
+        "odds_ratio": float(np.exp(log_or)),
+        "lower_ci": float(np.exp(log_or - z * se)),
+        "upper_ci": float(np.exp(log_or + z * se)),
+    }
+
+
+def cfr_naive_by_age(
+    df: pd.DataFrame,
+    *,
+    age_col: str = "age",
+    event_col: str = "event",
+    spline_df: int = 4,
+    degree: int = 3,
+    age_grid: Optional[np.ndarray] = None,
+    n_grid: int = 100,
+    age_bounds: Optional[Tuple[float, float]] = None,
+    alpha: float = 0.05,
+) -> Dict[str, Any]:
+    """Naive CFR (deaths / all reported cases) as a smooth function of continuous age.
+
+    Regression analogue of cfr_naive: every row (deaths, recoveries, and
+    still-open/censored cases alike) counts towards the denominator, matching
+    the deaths/cases definition, but death probability is modelled as
+    died ~ bs(age) rather than pooled into a single ratio.
+
+    `df` must have a numeric age column and an `event` column with values
+    "death" / "recovery" / "censored" (as produced by standardize_line_list).
+    Pass `age_bounds` to fix the spline's domain (e.g. to the full dataset's
+    age range) when comparing several fits on different subsets -- see
+    age_time_relative_risk_curves.
+    """
+    work = df.dropna(subset=[age_col]).copy()
+    work["died"] = (work[event_col] == "death").astype(int)
+
+    if work["died"].nunique() < 2:
+        raise ValueError("Need both deaths and non-deaths to fit an age-CFR curve.")
+
+    fit = _spline_logistic_fit(work, age_col, "died", spline_df=spline_df, degree=degree, age_bounds=age_bounds)
+
+    if age_grid is None:
+        lo, hi = age_bounds if age_bounds is not None else (work[age_col].min(), work[age_col].max())
+        age_grid = np.linspace(lo, hi, n_grid)
+
+    curve = _predict_cfr_curve(fit, age_grid, age_col=age_col, alpha=alpha)
+    return {"fit": fit, "curve": curve, "n": int(len(work)), "n_deaths": int(work["died"].sum())}
+
+
+def cfr_resolved_by_age(
+    df: pd.DataFrame,
+    *,
+    age_col: str = "age",
+    event_col: str = "event",
+    spline_df: int = 4,
+    degree: int = 3,
+    age_grid: Optional[np.ndarray] = None,
+    n_grid: int = 100,
+    age_bounds: Optional[Tuple[float, float]] = None,
+    alpha: float = 0.05,
+) -> Dict[str, Any]:
+    """Resolved-cohort CFR (deaths / (deaths + recoveries)) as a smooth function of age.
+
+    Regression analogue of cfr_resolved_cohort: restricted to individuals
+    with a known outcome (death or recovery), matching the resolved-cohort
+    estimator's conditioning on resolution, with death probability modelled
+    as died ~ bs(age) rather than pooled into a single ratio.
+
+    `df` must have a numeric age column and an `event` column with values
+    "death" / "recovery" / "censored" (as produced by standardize_line_list).
+    Pass `age_bounds` to fix the spline's domain (e.g. to the full dataset's
+    age range) when comparing several fits on different subsets -- see
+    age_time_relative_risk_curves.
+    """
+    work = df.dropna(subset=[age_col]).copy()
+    work = work.loc[work[event_col].isin(["death", "recovery"])].copy()
+    work["died"] = (work[event_col] == "death").astype(int)
+
+    if work["died"].nunique() < 2:
+        raise ValueError("Need both deaths and recoveries to fit an age-CFR curve.")
+
+    fit = _spline_logistic_fit(work, age_col, "died", spline_df=spline_df, degree=degree, age_bounds=age_bounds)
+
+    if age_grid is None:
+        lo, hi = age_bounds if age_bounds is not None else (work[age_col].min(), work[age_col].max())
+        age_grid = np.linspace(lo, hi, n_grid)
+
+    curve = _predict_cfr_curve(fit, age_grid, age_col=age_col, alpha=alpha)
+    return {"fit": fit, "curve": curve, "n": int(len(work)), "n_deaths": int(work["died"].sum())}
+
+
+def relative_curves_by_age(
+    fit,
+    age_grid: np.ndarray,
+    ref_age: float,
+    *,
+    age_col: str = "age",
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """Odds ratio and risk ratio of death across age_grid, relative to ref_age.
+
+    Both are computed on a log scale (log-odds difference for OR,
+    log-probability difference for RR) and back-transformed, using the
+    fitted spline's parameter covariance -- not the two points' marginal
+    CIs -- so the shared-parameter covariance between each grid age and the
+    reference age is accounted for correctly.
+    """
+    design_info = fit.model.data.design_info
+    age_grid = np.asarray(age_grid, dtype=float)
+
+    ref_row = np.asarray(patsy.build_design_matrices([design_info], {age_col: [float(ref_age)]})[0])[0]
+    grid_rows = np.asarray(patsy.build_design_matrices([design_info], {age_col: age_grid})[0])
+
+    params = np.asarray(fit.params)
+    cov = np.asarray(fit.cov_params())
+    z = norm.ppf(1 - alpha / 2)
+
+    linpred_ref = float(ref_row @ params)
+    var_ref = float(ref_row @ cov @ ref_row.T)
+    p_ref = expit(linpred_ref)
+
+    linpred_grid = grid_rows @ params
+    var_grid = np.einsum("ij,jk,ik->i", grid_rows, cov, grid_rows)
+    cov_grid_ref = grid_rows @ cov @ ref_row.T
+    p_grid = expit(linpred_grid)
+
+    # Odds ratio: OR(age) = exp(linpred(age) - linpred(ref_age))
+    log_or = linpred_grid - linpred_ref
+    var_log_or = var_grid + var_ref - 2 * cov_grid_ref
+    se_log_or = np.sqrt(np.clip(var_log_or, 0, None))
+
+    # Risk ratio: on the log scale, d log(expit(x))/dx = 1 - expit(x)
+    log_rr = np.log(p_grid) - np.log(p_ref)
+    var_log_rr = (
+        (1 - p_grid) ** 2 * var_grid
+        + (1 - p_ref) ** 2 * var_ref
+        - 2 * (1 - p_grid) * (1 - p_ref) * cov_grid_ref
+    )
+    se_log_rr = np.sqrt(np.clip(var_log_rr, 0, None))
+
+    return pd.DataFrame(
+        {
+            "age": age_grid,
+            "ref_age": float(ref_age),
+            "cfr": p_grid,
+            "odds_ratio": np.exp(log_or),
+            "or_lower_ci": np.exp(log_or - z * se_log_or),
+            "or_upper_ci": np.exp(log_or + z * se_log_or),
+            "risk_ratio": np.exp(log_rr),
+            "rr_lower_ci": np.exp(log_rr - z * se_log_rr),
+            "rr_upper_ci": np.exp(log_rr + z * se_log_rr),
+        }
+    )
+
+
+def _linelist_at_cutoff(
+    linelist: pd.DataFrame,
+    cutoff: pd.Timestamp,
+    *,
+    death_label: str = "death",
+    recovery_label: str = "recovery",
+) -> pd.DataFrame:
+    """Individual-level snapshot of a linelist as it would have looked at `cutoff`.
+
+    Cases with start_date <= cutoff enter the cohort; outcomes that occur
+    after cutoff (or haven't happened yet) are treated as censored at that
+    date. Same expanding-window logic as running_cfr_from_line_list, applied
+    per individual instead of aggregated into counts, so it can feed
+    cfr_naive_by_age / cfr_resolved_by_age at each snapshot.
+    """
+    observed = linelist.loc[linelist["start_date"] <= cutoff].copy()
+    resolved_death = (
+        (observed["event"] == death_label)
+        & observed["outcome_date"].notna()
+        & (observed["outcome_date"] <= cutoff)
+    )
+    resolved_recovery = (
+        (observed["event"] == recovery_label)
+        & observed["outcome_date"].notna()
+        & (observed["outcome_date"] <= cutoff)
+    )
+    observed["event"] = np.where(
+        resolved_death, death_label, np.where(resolved_recovery, recovery_label, "censored")
+    )
+    return observed
+
+
+def age_time_relative_risk_curves(
+    df: pd.DataFrame,
+    *,
+    method: str = "naive",
+    age_col: str = "age",
+    snapshot_fractions: Sequence[float] = (0.25, 0.4, 0.55, 0.7, 0.85, 1.0),
+    age_grid: Optional[np.ndarray] = None,
+    n_grid: int = 60,
+    ref_age: Optional[float] = None,
+    spline_df: int = 3,
+    degree: int = 3,
+    alpha: float = 0.05,
+    death_label: str = "death",
+    recovery_label: str = "recovery",
+    min_events: int = 15,
+) -> pd.DataFrame:
+    """OR(age) and RR(age) at successive snapshots of outbreak progression.
+
+    `df` should be a standardized, single-outbreak linelist (start_date,
+    outcome_date, event, age) -- e.g. from standardize_line_list applied to
+    one outbreak's data. At each snapshot fraction of the outbreak's date
+    range, the cohort is truncated as of that date (_linelist_at_cutoff),
+    the age-CFR model is refit (cfr_naive_by_age or cfr_resolved_by_age),
+    and OR/RR are computed relative to a fixed reference age (kept the same
+    across snapshots for comparability).
+
+    Snapshots where either outcome class has fewer than `min_events` cases
+    are skipped (with a warning) rather than fit: with only a handful of
+    events spread across a df=3 spline basis, the logistic fit can quasi-
+    separate and produce enormous/infinite extrapolated ORs at the tails
+    that reflect sample-size noise, not signal -- this happens in practice
+    for the earliest snapshots of a small outbreak.
+    """
+    if method not in {"naive", "resolved"}:
+        raise ValueError("method must be 'naive' or 'resolved'")
+    fit_fn = cfr_naive_by_age if method == "naive" else cfr_resolved_by_age
+
+    work = df.dropna(subset=[age_col]).copy()
+    work["start_date"] = _to_datetime(work["start_date"])
+    work["outcome_date"] = _to_datetime(work["outcome_date"])
+
+    age_bounds = (float(work[age_col].min()), float(work[age_col].max()))
+    if age_grid is None:
+        age_grid = np.linspace(age_bounds[0], age_bounds[1], n_grid)
+    if ref_age is None:
+        ref_age = float(work[age_col].median())
+
+    start = work["start_date"].min()
+    end_candidates = [work["start_date"].max(), work["outcome_date"].max()]
+    end_candidates = [d for d in end_candidates if pd.notna(d)]
+    end = max(end_candidates) if end_candidates else start
+    span = end - start
+
+    frames = []
+    for frac in snapshot_fractions:
+        cutoff = start + frac * span
+        snapshot = _linelist_at_cutoff(
+            work, cutoff, death_label=death_label, recovery_label=recovery_label
+        )
+
+        if method == "naive":
+            n_died = int((snapshot["event"] == death_label).sum())
+            n_other = int(len(snapshot) - n_died)
+        else:
+            resolved = snapshot.loc[snapshot["event"].isin([death_label, recovery_label])]
+            n_died = int((resolved["event"] == death_label).sum())
+            n_other = int(len(resolved) - n_died)
+
+        if n_died < min_events or n_other < min_events:
+            warnings.warn(
+                f"Skipping snapshot at {cutoff.date()} (frac={frac}): "
+                f"{n_died} deaths / {n_other} other outcomes (< min_events={min_events})."
+            )
+            continue
+
+        try:
+            fit_result = fit_fn(
+                snapshot,
+                age_col=age_col,
+                spline_df=spline_df,
+                degree=degree,
+                age_grid=age_grid,
+                age_bounds=age_bounds,
+                alpha=alpha,
+            )
+        except ValueError as exc:
+            warnings.warn(f"Skipping snapshot at {cutoff.date()} (frac={frac}): {exc}")
+            continue
+
+        curve = relative_curves_by_age(fit_result["fit"], age_grid, ref_age, age_col=age_col, alpha=alpha)
+        curve["cutoff"] = cutoff
+        curve["frac"] = frac
+        curve["days_since_start"] = (cutoff - start).days
+        curve["n"] = fit_result["n"]
+        curve["n_deaths"] = fit_result["n_deaths"]
+        frames.append(curve)
+
+    if not frames:
+        raise ValueError("No snapshot produced a usable fit; check snapshot_fractions and data volume.")
+
+    return pd.concat(frames, ignore_index=True)
 
 
 def cfr_delay_adjusted_nishiura(
@@ -902,6 +1358,339 @@ def cfr_competing_risk1(
 
     return float(cif_death)
 
+
+# ---------------------------------------------------------------------------
+# Age-specific (continuous) competing risks: cause-specific hazards regression
+#
+# The direct regression extension of cfr_competing_risks (Aalen-Johansen):
+# both use the identical risk-set definition (someone leaves the risk set
+# for further death/recovery events the moment either occurs) and the
+# identical product-integral recombination -- see the recursion in
+# cfr_competing_risk1 above. The only change here is that each cause-specific
+# hazard is itself a function of age (via a Cox model with a B-spline term,
+# fit with statsmodels PHReg) instead of a single pooled rate.
+# ---------------------------------------------------------------------------
+
+
+_MAX_ABS_PHREG_COEF = 15.0  # exp(15) =~ 3.3M -- already far beyond any plausible HR;
+# anything past this is quasi-separation that stopped short of literally
+# diverging to inf/nan, not a real effect. See the Yambuku recovery model
+# that motivated this: 11 events on 4 spline params converged (finite
+# params/cov) to coefficients in the hundreds (HR ~ exp(400)), which passed
+# a finite-only check but produced nonsense hazard ratios and CIF artifacts.
+
+
+def _check_phreg_converged(result, status_col: str, n_events: int, spline_df: int, degree: int) -> None:
+    params = np.asarray(result.params)
+    cov = np.asarray(result.cov_params())
+    max_abs_coef = float(np.max(np.abs(params))) if params.size else 0.0
+    if not np.all(np.isfinite(params)) or not np.all(np.isfinite(cov)) or max_abs_coef > _MAX_ABS_PHREG_COEF:
+        raise ValueError(
+            f"Cox model for '{status_col}' failed to converge stably (non-finite "
+            f"parameters, or |coef| up to {max_abs_coef:.3g} indicating quasi-separation) "
+            f"with spline_df={spline_df}, degree={degree} on {n_events} events -- likely "
+            f"too few events for this many parameters. Try a lower spline_df or more data."
+        )
+
+
+def _phreg_spline_fit(
+    data: pd.DataFrame,
+    age_col: str,
+    time_col: str,
+    status_col: str,
+    *,
+    spline_df: int = 4,
+    degree: int = 3,
+    age_bounds: Optional[Tuple[float, float]] = None,
+):
+    """Fit a cause-specific Cox model, time ~ bs(age), via statsmodels PHReg."""
+    n_unique_ages = data[age_col].nunique()
+    if n_unique_ages <= degree:
+        raise ValueError(
+            f"Only {n_unique_ages} distinct age value(s) available; need more than "
+            f"degree={degree} to fit a spline. Reduce spline_df/degree or supply more data."
+        )
+    bounds_arg = f", lower_bound={age_bounds[0]}, upper_bound={age_bounds[1]}" if age_bounds is not None else ""
+    formula = f"{time_col} ~ bs({age_col}, df={spline_df}, degree={degree}{bounds_arg})"
+    # Efron ties: more accurate than the Breslow default when many individuals
+    # share an event time (day-resolution outbreak data has plenty of this),
+    # since Breslow's approximation biases toward the null as tie density grows.
+    model = sm.PHReg.from_formula(formula, data=data, status=status_col, ties="efron")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        result = model.fit()
+
+    _check_phreg_converged(result, status_col, int(data[status_col].sum()), spline_df, degree)
+    return result
+
+
+def _fit_phreg_with_fallback(
+    data: pd.DataFrame,
+    age_col: str,
+    time_col: str,
+    status_col: str,
+    *,
+    spline_df: int = 4,
+    degree: int = 3,
+    age_bounds: Optional[Tuple[float, float]] = None,
+) -> Tuple[Any, int]:
+    """Try a cubic spline on age, backing off to fewer basis functions and
+    finally to a single linear age term, until one converges.
+
+    Rather than pre-guessing whether a given event count will support
+    spline_df parameters (see the docstring history of min_events in
+    age_time_relative_risk_curves -- that was a rough, empirically-tuned
+    guess, not a guarantee), this just tries fitting at decreasing
+    complexity and checks convergence directly (via _phreg_spline_fit's
+    finite-parameters check) each time. Returns (fit, df_used), where
+    df_used=1 signals the linear fallback (no spline). Raises ValueError,
+    with every attempt's failure reason, only if nothing converges.
+    """
+    attempts = []
+    for df_candidate in range(spline_df, degree - 1, -1):
+        try:
+            fit = _phreg_spline_fit(
+                data, age_col, time_col, status_col,
+                spline_df=df_candidate, degree=degree, age_bounds=age_bounds,
+            )
+            return fit, df_candidate
+        except ValueError as exc:
+            attempts.append(f"spline df={df_candidate}: {exc}")
+
+    # Last resort: a single linear age term (no spline at all).
+    try:
+        model = sm.PHReg.from_formula(f"{time_col} ~ {age_col}", data=data, status=status_col, ties="efron")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            fit = model.fit()
+        _check_phreg_converged(fit, status_col, int(data[status_col].sum()), spline_df=1, degree=1)
+        return fit, 1
+    except ValueError as exc:
+        attempts.append(f"linear: {exc}")
+
+    raise ValueError(
+        f"No age term converged for '{status_col}' at any complexity. Attempts:\n  "
+        + "\n  ".join(attempts)
+    )
+
+
+def hazard_ratio_curve_by_age(
+    fit,
+    age_grid: np.ndarray,
+    ref_age: float,
+    *,
+    age_col: str = "age",
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """Cause-specific hazard ratio across age_grid, relative to ref_age.
+
+    Same delta-method construction as age_cfr_odds_ratio / the OR piece of
+    relative_curves_by_age -- it's duck-typed against anything exposing
+    model.data.design_info / params / cov_params(), so it works unchanged
+    for a PHReg Cox fit here, not just the GLM logistic fits, since both are
+    log-linear in the covariates (only the meaning of "linear predictor"
+    differs: log-odds there, log-hazard here).
+    """
+    design_info = fit.model.data.design_info
+    age_grid = np.asarray(age_grid, dtype=float)
+
+    ref_row = np.asarray(patsy.build_design_matrices([design_info], {age_col: [float(ref_age)]})[0])[0]
+    grid_rows = np.asarray(patsy.build_design_matrices([design_info], {age_col: age_grid})[0])
+
+    params = np.asarray(fit.params)
+    cov = np.asarray(fit.cov_params())
+    z = norm.ppf(1 - alpha / 2)
+
+    log_hr = grid_rows @ params - float(ref_row @ params)
+    var_ref = float(ref_row @ cov @ ref_row.T)
+    var_grid = np.einsum("ij,jk,ik->i", grid_rows, cov, grid_rows)
+    cov_grid_ref = grid_rows @ cov @ ref_row.T
+    se_log_hr = np.sqrt(np.clip(var_grid + var_ref - 2 * cov_grid_ref, 0, None))
+
+    return pd.DataFrame(
+        {
+            "age": age_grid,
+            "ref_age": float(ref_age),
+            "hazard_ratio": np.exp(log_hr),
+            "hr_lower_ci": np.exp(log_hr - z * se_log_hr),
+            "hr_upper_ci": np.exp(log_hr + z * se_log_hr),
+        }
+    )
+
+
+def _baseline_hazard_steps(fit) -> Tuple[np.ndarray, np.ndarray]:
+    """Jump times and jump sizes of a PHReg fit's Breslow baseline cumulative hazard."""
+    t, cumhaz, _ = fit.baseline_cumulative_hazard[0]
+    t = np.asarray(t, dtype=float)
+    cumhaz = np.asarray(cumhaz, dtype=float)
+    jumps = np.diff(np.concatenate([[0.0], cumhaz]))
+    return t, jumps
+
+
+def cif_by_age_from_cause_specific_fits(
+    fit_death,
+    fit_recovery,
+    age_grid: np.ndarray,
+    *,
+    age_col: str = "age",
+    horizon: Optional[float] = None,
+) -> pd.DataFrame:
+    """CIF of death by age, recombined from two cause-specific Cox fits.
+
+    Point estimates only -- a CI here would need the delta method propagated
+    through the whole product integral (or a bootstrap), not done in this
+    first pass.
+
+    cfr_competing_risk1's raw nonparametric recursion works directly with
+    count ratios (d_death/at_risk), which are always <= 1 by construction.
+    Once hazard jumps are scaled per age by exp(linear predictor), that
+    guarantee is gone -- a jump can come out above 1 for an age far from
+    where the baseline was effectively centered (seen in practice: Yambuku's
+    youngest ages pushed a scaled death-hazard jump past 1, and summing
+    S(t-) * dH_death directly produced a "CIF" of 1.23). So each jump is
+    converted to a proper bounded transition probability first,
+    1 - exp(-total_hazard) split proportionally between the two causes by
+    their hazard share, then combined via the standard product-limit
+    survival -- this reduces to the same recursion as cfr_competing_risk1 in
+    the small-hazard limit, but stays in [0, 1] regardless of scaling.
+    """
+    design_death = fit_death.model.data.design_info
+    design_recovery = fit_recovery.model.data.design_info
+    age_grid = np.asarray(age_grid, dtype=float)
+
+    rows_death = np.asarray(patsy.build_design_matrices([design_death], {age_col: age_grid})[0])
+    rows_recovery = np.asarray(patsy.build_design_matrices([design_recovery], {age_col: age_grid})[0])
+    scale_death = np.exp(rows_death @ np.asarray(fit_death.params))
+    scale_recovery = np.exp(rows_recovery @ np.asarray(fit_recovery.params))
+
+    t_death, jump_death = _baseline_hazard_steps(fit_death)
+    t_recovery, jump_recovery = _baseline_hazard_steps(fit_recovery)
+
+    all_times = np.union1d(t_death, t_recovery)
+    if horizon is not None:
+        all_times = all_times[all_times <= horizon]
+
+    jump_death_on_grid = pd.Series(jump_death, index=t_death).reindex(all_times, fill_value=0.0).to_numpy()
+    jump_recovery_on_grid = pd.Series(jump_recovery, index=t_recovery).reindex(all_times, fill_value=0.0).to_numpy()
+
+    cif = np.empty(age_grid.shape[0])
+    for j in range(age_grid.shape[0]):
+        dH_death = jump_death_on_grid * scale_death[j]
+        dH_recovery = jump_recovery_on_grid * scale_recovery[j]
+        total_hazard = dH_death + dH_recovery
+
+        # bounded probability of leaving the "alive" state at each jump,
+        # given alive just before it, split between the two causes by their
+        # relative hazard share
+        p_leave = -np.expm1(-total_hazard)  # = 1 - exp(-total_hazard), stable for small total_hazard
+        with np.errstate(invalid="ignore", divide="ignore"):
+            frac_death = np.where(total_hazard > 0, dH_death / total_hazard, 0.0)
+        p_death = frac_death * p_leave
+
+        S_prev = np.concatenate([[1.0], np.cumprod(1.0 - p_leave)[:-1]])
+        cif[j] = float(np.sum(S_prev * p_death))
+
+    return pd.DataFrame(
+        {
+            "age": age_grid,
+            "cif_death": cif,
+            "horizon": all_times[-1] if all_times.size else np.nan,
+        }
+    )
+
+
+def cfr_competing_risks_by_age(
+    df: pd.DataFrame,
+    *,
+    age_col: str = "age",
+    start_col: str = "start_date",
+    outcome_date_col: str = "outcome_date",
+    event_col: str = "event",
+    analysis_date: Optional[pd.Timestamp] = None,
+    death_label: str = "death",
+    recovery_label: str = "recovery",
+    spline_df: int = 4,
+    degree: int = 3,
+    age_grid: Optional[np.ndarray] = None,
+    n_grid: int = 100,
+    ref_age: Optional[float] = None,
+    alpha: float = 0.05,
+    horizon: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Cause-specific hazards regression for death vs. recovery, with age
+    entered via a B-spline -- the age-specific analogue of cfr_competing_risks.
+
+    Fits two Cox models (death-cause and recovery-cause), each
+    time ~ bs(age); an individual is censored (removed from the risk set)
+    for a given cause's model the moment their own event, or the competing
+    event, or administrative censoring occurs -- the same risk set
+    cfr_competing_risks/cfr_competing_risk1 use.
+
+    Each cause's model starts at spline_df basis functions and backs off to
+    fewer (then to a plain linear age term) if it fails to converge --
+    see _fit_phreg_with_fallback. death_df_used / recovery_df_used in the
+    returned dict report what actually got used (1 = linear fallback), so
+    it's visible when a curve came from a lower-flexibility model than
+    requested.
+
+    Returns:
+      - death_hazard_ratio / recovery_hazard_ratio: cause-specific HR(age)
+        relative to a reference age, each with a Wald CI.
+      - cif: the recombined CIF-of-death-by-age curve (point estimate only).
+    """
+    if df[age_col].dropna().empty:
+        raise ValueError(f"No rows with '{age_col}' recorded; nothing to fit.")
+
+    time_event = _prepare_individual_time_data(
+        df,
+        start_col=start_col,
+        outcome_date_col=outcome_date_col,
+        event_col=event_col,
+        analysis_date=analysis_date,
+        death_label=death_label,
+        recovery_label=recovery_label,
+    )
+    work = time_event.join(df[[age_col]]).dropna(subset=[age_col])
+    work["status_death"] = (work["event"] == death_label).astype(int)
+    work["status_recovery"] = (work["event"] == recovery_label).astype(int)
+
+    n_deaths = int(work["status_death"].sum())
+    n_recoveries = int(work["status_recovery"].sum())
+    if n_deaths < 2 or n_recoveries < 2:
+        raise ValueError(
+            f"Need at least 2 deaths and 2 recoveries with age recorded to fit "
+            f"cause-specific hazard models (got {n_deaths} deaths, {n_recoveries} recoveries)."
+        )
+
+    age_bounds = (float(work[age_col].min()), float(work[age_col].max()))
+    if age_grid is None:
+        age_grid = np.linspace(age_bounds[0], age_bounds[1], n_grid)
+    if ref_age is None:
+        ref_age = float(work[age_col].median())
+
+    fit_death, death_df_used = _fit_phreg_with_fallback(
+        work, age_col, "time", "status_death", spline_df=spline_df, degree=degree, age_bounds=age_bounds
+    )
+    fit_recovery, recovery_df_used = _fit_phreg_with_fallback(
+        work, age_col, "time", "status_recovery", spline_df=spline_df, degree=degree, age_bounds=age_bounds
+    )
+
+    death_hr = hazard_ratio_curve_by_age(fit_death, age_grid, ref_age, age_col=age_col, alpha=alpha)
+    recovery_hr = hazard_ratio_curve_by_age(fit_recovery, age_grid, ref_age, age_col=age_col, alpha=alpha)
+    cif = cif_by_age_from_cause_specific_fits(fit_death, fit_recovery, age_grid, age_col=age_col, horizon=horizon)
+
+    return {
+        "fit_death": fit_death,
+        "fit_recovery": fit_recovery,
+        "death_hazard_ratio": death_hr,
+        "recovery_hazard_ratio": recovery_hr,
+        "cif": cif,
+        "n": int(len(work)),
+        "n_deaths": n_deaths,
+        "n_recoveries": n_recoveries,
+        "death_df_used": death_df_used,
+        "recovery_df_used": recovery_df_used,
+    }
 
 
 def _greenwood_var_survival(y, d_all, s):
@@ -2140,8 +2929,17 @@ __all__ = [
     "estimate_delay_distribution_from_dates",
     "cfr_naive",
     "cfr_resolved_cohort",
+    "parse_age_bands",
+    "cfr_naive_by_age",
+    "cfr_resolved_by_age",
+    "age_cfr_odds_ratio",
+    "relative_curves_by_age",
+    "age_time_relative_risk_curves",
     "cfr_delay_adjusted_nishiura",
     "cfr_competing_risks",
+    "cfr_competing_risks_by_age",
+    "hazard_ratio_curve_by_age",
+    "cif_by_age_from_cause_specific_fits",
     "cfr_ghani_2005_km",
     "cfr_parametric_mixture",
     "running_cfr_from_count_table",
@@ -2380,6 +3178,9 @@ def adapt_rosello_to_linelist(
         }
     )
 
+    if "Age" in df.columns:
+        work["age"] = _coerce_numeric(df["Age"])
+
     return work.dropna(subset=["start_date"]).copy()
 def adapt_rosello_to_linelist_by_outbreak(
     df: pd.DataFrame,
@@ -2512,6 +3313,8 @@ def adapt_kenema_to_linelist(df: pd.DataFrame) -> pd.DataFrame:
     if "Date of discharge" in work.columns:
         outcome_date = outcome_date.fillna(_to_datetime(work["Date of discharge"], dayfirst=False))
     work = pd.DataFrame({"start_date": fallback, "outcome_date": outcome_date, "event": event})
+    if "Age" in df.columns:
+        work["age"] = _coerce_numeric(df["Age"])
     work = work.dropna(subset=["start_date"]).copy()
     return work
 
