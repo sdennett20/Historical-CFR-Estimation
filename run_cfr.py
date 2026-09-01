@@ -581,7 +581,7 @@ linelists["Boende"].to_csv("Boende_linelist.csv", index=False)
 
 
 skip = {"Tandala"}
-# skip = {"Tandala","Boende","Mweka2008","Yambuku","Isiro","Mweka2007","Kikwit"}
+skip = {"Tandala","Boende","Mweka2008","Yambuku","Isiro","Mweka2007","Kikwit"}
 
 for name, ll in linelists.items():
     if name in skip:
@@ -678,7 +678,89 @@ for name, ll in linelists.items():
     print(f"Results written to: Results/cfr_results_{name}.csv")
     print(f"Figure written to: Results/cfr_results_{name}.png")
 
-# Current DRC outbreak 
+# Age-specific CFR: OR/RR of death by age, at successive outbreak snapshots.
+# Only Rosello's linelists carry real per-individual continuous age, so this
+# runs over `linelists` from the loop above. Naive and resolved-cohort are
+# both fit; a given outbreak/method is skipped (with a printed reason)
+# whenever it doesn't have enough deaths and enough non-deaths (or
+# recoveries, for resolved) with age recorded -- see min_events in
+# age_time_relative_risk_curves.
+from cfr_exact import age_time_relative_risk_curves
+from plot_age_time_cfr import plot_age_time_relative_risk
+
+MIN_AGE_N = 20
+
+for name, ll_outbreak in linelists.items():
+    if "age" not in ll_outbreak.columns:
+        continue
+    ll_age = ll_outbreak.dropna(subset=["age"])
+    if len(ll_age) < MIN_AGE_N:
+        print(f"{name}: skipping age-specific CFR (only {len(ll_age)} individuals with age, need >= {MIN_AGE_N})")
+        continue
+
+    for method in ["naive", "resolved"]:
+        try:
+            curves = age_time_relative_risk_curves(ll_age, method=method, spline_df=3)
+        except ValueError as exc:
+            print(f"{name} ({method}): skipping age-specific CFR -- {exc}")
+            continue
+
+        curves.to_csv(f"Results/age_time_relative_risk_{name}_{method}.csv", index=False)
+
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5.5))
+        plot_age_time_relative_risk(curves, value="odds_ratio", ax=axes[0], title=f"{name} ({method}) - OR by age")
+        plot_age_time_relative_risk(curves, value="risk_ratio", ax=axes[1], title=f"{name} ({method}) - RR by age")
+        fig.tight_layout()
+        fig.savefig(f"Results/age_time_relative_risk_{name}_{method}.png", dpi=150)
+        plt.close(fig)
+
+        print(f"{name} ({method}): saved Results/age_time_relative_risk_{name}_{method}.png")
+
+# Age-specific competing risks: cause-specific hazards regression (death vs.
+# recovery), the direct regression extension of cfr_competing_risks
+# (Aalen-Johansen) -- same risk-set definition and product-integral
+# recombination, but each cause-specific hazard is a smooth function of age.
+# Same `linelists` dict as above. No pre-filter on event counts: each cause's
+# Cox model itself tries a cubic spline, backs off to fewer basis functions,
+# then to a plain linear age term, checking actual convergence at each step
+# (see _fit_phreg_with_fallback in cfr_exact.py) -- an outbreak is only
+# skipped if nothing converges even at linear.
+from cfr_exact import cfr_competing_risks_by_age, _prepare_individual_time_data, cfr_competing_risks
+from plot_competing_risks_by_age import plot_hazard_ratio, plot_cif
+
+for name, ll_outbreak in linelists.items():
+    if "age" not in ll_outbreak.columns:
+        continue
+    ll_age = ll_outbreak.dropna(subset=["age"])
+
+    try:
+        res = cfr_competing_risks_by_age(ll_age, spline_df=4)
+    except ValueError as exc:
+        print(f"{name}: skipping age-specific competing risks -- {exc}")
+        continue
+
+    res["death_hazard_ratio"].to_csv(f"Results/competing_risks_by_age_{name}_death_hr.csv", index=False)
+    res["recovery_hazard_ratio"].to_csv(f"Results/competing_risks_by_age_{name}_recovery_hr.csv", index=False)
+    res["cif"].to_csv(f"Results/competing_risks_by_age_{name}_cif.csv", index=False)
+
+    time_event = _prepare_individual_time_data(ll_age)
+    pooled = cfr_competing_risks(time_event.assign(time=time_event["time"]), time_col="time", event_col="event")
+
+    fig, axes = plt.subplots(1, 3, figsize=(19, 5.5))
+    plot_hazard_ratio(axes[0], res["death_hazard_ratio"], title=f"{name} - cause-specific HR: death")
+    plot_hazard_ratio(axes[1], res["recovery_hazard_ratio"], title=f"{name} - cause-specific HR: recovery")
+    plot_cif(axes[2], res["cif"], pooled_cfr=pooled["estimate"], title=f"{name} - recombined CIF of death")
+    fig.tight_layout()
+    fig.savefig(f"Results/competing_risks_by_age_{name}.png", dpi=150)
+    plt.close(fig)
+
+    print(
+        f"{name}: saved Results/competing_risks_by_age_{name}.png "
+        f"(n={res['n']}, deaths={res['n_deaths']}, recoveries={res['n_recoveries']}, "
+        f"death model df={res['death_df_used']}, recovery model df={res['recovery_df_used']})"
+    )
+
+# Current DRC outbreak
 from cfr_exact import adapt_drc_consolidated_to_counts
 # DRC 2026
 df = pd.read_csv("Data/drc_ebola_cases_consolidated.csv")
