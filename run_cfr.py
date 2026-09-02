@@ -5,6 +5,7 @@ import numpy as np
 from scipy import stats
 import matplotlib.colors as mcolors
 from typing import Optional
+import warnings
 
 # helper for plotting 
 def plot_method_with_ci(ax, data, method, *, alpha=0.18, linewidth=2, label=None):
@@ -725,7 +726,12 @@ for name, ll_outbreak in linelists.items():
 # then to a plain linear age term, checking actual convergence at each step
 # (see _fit_phreg_with_fallback in cfr_exact.py) -- an outbreak is only
 # skipped if nothing converges even at linear.
-from cfr_exact import cfr_competing_risks_by_age, _prepare_individual_time_data, cfr_competing_risks
+#
+# Uses the bootstrap-CI wrapper (cfr_competing_risks_by_age_ci) so the CIF
+# panel gets a proper CI band instead of a point estimate only -- each
+# bootstrap resample refits both cause-specific models from scratch, so this
+# is slower (~200 refits per outbreak) but still only seconds per outbreak.
+from cfr_exact import cfr_competing_risks_by_age_ci, _prepare_individual_time_data, cfr_competing_risks
 from plot_competing_risks_by_age import plot_hazard_ratio, plot_cif
 
 for name, ll_outbreak in linelists.items():
@@ -734,7 +740,9 @@ for name, ll_outbreak in linelists.items():
     ll_age = ll_outbreak.dropna(subset=["age"])
 
     try:
-        res = cfr_competing_risks_by_age(ll_age, spline_df=4)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            res = cfr_competing_risks_by_age_ci(ll_age, spline_df=4, n_boot=200, seed=0)
     except ValueError as exc:
         print(f"{name}: skipping age-specific competing risks -- {exc}")
         continue
@@ -757,8 +765,63 @@ for name, ll_outbreak in linelists.items():
     print(
         f"{name}: saved Results/competing_risks_by_age_{name}.png "
         f"(n={res['n']}, deaths={res['n_deaths']}, recoveries={res['n_recoveries']}, "
-        f"death model df={res['death_df_used']}, recovery model df={res['recovery_df_used']})"
+        f"death model df={res['death_df_used']}, recovery model df={res['recovery_df_used']}, "
+        f"bootstrap {res['n_boot_success']}/{res['n_boot']})"
     )
+
+# Healthcare worker vs. not: a binary covariate, so a direct group split is
+# the natural (lossless) analysis rather than an approximation the way
+# binning continuous age would be. cfr_group_comparison runs all six pooled
+# estimators separately per group; group_death_ratio/group_hazard_ratio add
+# a formal comparison (OR, RR, HR) with its own CI, via a single-covariate
+# GLM/Cox fit -- no spline machinery needed, so no convergence fallback.
+from cfr_exact import (
+    load_uganda_2022,
+    adapt_uganda_to_linelist,
+    cfr_group_comparison,
+    group_death_ratio,
+    group_hazard_ratio,
+)
+
+hcw_sources = {
+    "Kikwit": linelists["Kikwit"],
+    "Isiro": linelists["Isiro"],
+    "Boende": linelists["Boende"],
+    "Uganda": adapt_uganda_to_linelist(load_uganda_2022("Data/Uganda2022globaldothealth.csv")),
+}
+
+for name, ll_hcw in hcw_sources.items():
+    if "is_hcw" not in ll_hcw.columns:
+        print(f"{name}: skipping HCW comparison -- no is_hcw column")
+        continue
+    ll_hcw = ll_hcw.dropna(subset=["is_hcw"])
+    print(f"{name}: is_hcw counts {ll_hcw['is_hcw'].value_counts().to_dict()}")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        comparison = cfr_group_comparison(ll_hcw)
+    comparison.to_csv(f"Results/hcw_comparison_{name}.csv", index=False)
+
+    ratio_rows = []
+    for method in ["naive", "resolved"]:
+        try:
+            r = group_death_ratio(ll_hcw, method=method)
+            r["method"] = method
+            ratio_rows.append(r)
+        except ValueError as exc:
+            print(f"{name} ({method} OR/RR): skipped -- {exc}")
+
+    try:
+        hr = group_hazard_ratio(ll_hcw, cause="death")
+        hr["method"] = "competing_risks_hr"
+        ratio_rows.append(hr)
+    except ValueError as exc:
+        print(f"{name} (death HR): skipped -- {exc}")
+
+    if ratio_rows:
+        pd.DataFrame(ratio_rows).to_csv(f"Results/hcw_ratios_{name}.csv", index=False)
+
+    print(f"{name}: saved Results/hcw_comparison_{name}.csv and Results/hcw_ratios_{name}.csv")
 
 # Current DRC outbreak
 from cfr_exact import adapt_drc_consolidated_to_counts

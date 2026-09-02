@@ -676,6 +676,32 @@ def cfr_resolved_cohort(deaths: Union[pd.Series, np.ndarray, float, int], recove
 # ---------------------------------------------------------------------------
 
 
+_MAX_ABS_LOG_LINEAR_COEF = 15.0  # exp(15) =~ 3.3M -- already far beyond any plausible
+# OR/HR; anything past this is quasi-separation that stopped short of literally
+# diverging to inf/nan, not a real effect. See the Yambuku recovery model that
+# motivated this: 11 events on 4 spline params converged (finite params/cov) to
+# coefficients in the hundreds (HR ~ exp(400)), which passed a finite-only check
+# but produced nonsense hazard ratios and CIF artifacts. Shared between the GLM
+# (log-odds) and PHReg (log-hazard) checks below -- same failure mode, same fix,
+# regardless of which scale the linear predictor lives on.
+
+
+def _check_glm_converged(result) -> None:
+    params = np.asarray(result.params)
+    cov = np.asarray(result.cov_params())
+    max_abs_coef = float(np.max(np.abs(params))) if params.size else 0.0
+    if (
+        not getattr(result, "converged", True)
+        or not np.all(np.isfinite(params))
+        or not np.all(np.isfinite(cov))
+        or max_abs_coef > _MAX_ABS_LOG_LINEAR_COEF
+    ):
+        raise ValueError(
+            f"GLM failed to converge stably (solver converged={getattr(result, 'converged', None)}, "
+            f"|coef| up to {max_abs_coef:.3g} indicating possible quasi-separation)."
+        )
+
+
 def _spline_logistic_fit(
     data: pd.DataFrame,
     age_col: str,
@@ -703,7 +729,62 @@ def _spline_logistic_fit(
     bounds_arg = f", lower_bound={age_bounds[0]}, upper_bound={age_bounds[1]}" if age_bounds is not None else ""
     formula = f"{died_col} ~ bs({age_col}, df={spline_df}, degree={degree}{bounds_arg})"
     model = smf.glm(formula, data=data, family=sm.families.Binomial())
-    return model.fit()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        result = model.fit()
+    _check_glm_converged(result)
+    return result
+
+
+def _fit_glm_with_model_selection(
+    data: pd.DataFrame,
+    age_col: str,
+    died_col: str,
+    *,
+    spline_df: int = 4,
+    degree: int = 3,
+    age_bounds: Optional[Tuple[float, float]] = None,
+) -> Tuple[Any, int]:
+    """Fit died ~ bs(age) at several spline complexities (plus a plain linear
+    age term), and keep whichever converges cleanly with the lowest AIC --
+    model selection among the candidates that fit properly, rather than a
+    fallback ladder that just stops at the first one that happens to
+    converge (that answers "what's the most flexible thing I could get away
+    with," not "what does the data actually support").
+
+    Returns (fit, df_used); df_used=1 signals the linear candidate won.
+    Raises ValueError, with every attempt's failure reason, only if nothing
+    converges (including linear).
+    """
+    candidates = []
+    attempts = []
+    for df_candidate in range(spline_df, degree - 1, -1):
+        try:
+            fit = _spline_logistic_fit(
+                data, age_col, died_col, spline_df=df_candidate, degree=degree, age_bounds=age_bounds
+            )
+            candidates.append((fit, df_candidate, float(fit.aic)))
+        except ValueError as exc:
+            attempts.append(f"spline df={df_candidate}: {exc}")
+
+    try:
+        model = smf.glm(f"{died_col} ~ {age_col}", data=data, family=sm.families.Binomial())
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            fit = model.fit()
+        _check_glm_converged(fit)
+        candidates.append((fit, 1, float(fit.aic)))
+    except ValueError as exc:
+        attempts.append(f"linear: {exc}")
+
+    if not candidates:
+        raise ValueError(
+            f"No age term converged for '{died_col}' at any complexity. Attempts:\n  "
+            + "\n  ".join(attempts)
+        )
+
+    best_fit, best_df, best_aic = min(candidates, key=lambda c: c[2])
+    return best_fit, best_df
 
 
 def _predict_cfr_curve(
@@ -726,6 +807,30 @@ def _predict_cfr_curve(
     )
 
 
+def _get_design_info(fit):
+    """The fitted formula's patsy DesignInfo, robust across statsmodels versions.
+
+    statsmodels renamed this attribute on model.data from `design_info` to
+    `model_spec` at some point around 0.15 (same underlying
+    patsy.design_info.DesignInfo object either way -- confirmed by direct
+    inspection, not just documentation). Hard-coding `.design_info`
+    everywhere silently breaks under the newer name (AttributeError deep
+    inside relative_curves_by_age/age_cfr_odds_ratio/CIF combination, with
+    no hint that it's a version issue) -- this is why cross-environment
+    testing matters even when "it works here."
+    """
+    data = fit.model.data
+    if hasattr(data, "design_info"):
+        return data.design_info
+    if hasattr(data, "model_spec"):
+        return data.model_spec
+    raise AttributeError(
+        "Could not find a patsy DesignInfo on this fit's model.data (looked for "
+        "'design_info' and 'model_spec') -- statsmodels may have renamed it again; "
+        f"available attributes: {[a for a in dir(data) if not a.startswith('_')]}"
+    )
+
+
 def age_cfr_odds_ratio(
     fit,
     age1: float,
@@ -741,7 +846,7 @@ def age_cfr_odds_ratio(
     predictions (they share the same spline basis/parameters) is accounted
     for correctly.
     """
-    design_info = fit.model.data.design_info
+    design_info = _get_design_info(fit)
     rows = np.asarray(patsy.build_design_matrices([design_info], {age_col: [age1, age2]})[0])
     diff = rows[1] - rows[0]
     params = np.asarray(fit.params)
@@ -791,14 +896,22 @@ def cfr_naive_by_age(
     if work["died"].nunique() < 2:
         raise ValueError("Need both deaths and non-deaths to fit an age-CFR curve.")
 
-    fit = _spline_logistic_fit(work, age_col, "died", spline_df=spline_df, degree=degree, age_bounds=age_bounds)
+    fit, df_used = _fit_glm_with_model_selection(
+        work, age_col, "died", spline_df=spline_df, degree=degree, age_bounds=age_bounds
+    )
 
     if age_grid is None:
         lo, hi = age_bounds if age_bounds is not None else (work[age_col].min(), work[age_col].max())
         age_grid = np.linspace(lo, hi, n_grid)
 
     curve = _predict_cfr_curve(fit, age_grid, age_col=age_col, alpha=alpha)
-    return {"fit": fit, "curve": curve, "n": int(len(work)), "n_deaths": int(work["died"].sum())}
+    return {
+        "fit": fit,
+        "curve": curve,
+        "n": int(len(work)),
+        "n_deaths": int(work["died"].sum()),
+        "df_used": df_used,
+    }
 
 
 def cfr_resolved_by_age(
@@ -833,14 +946,22 @@ def cfr_resolved_by_age(
     if work["died"].nunique() < 2:
         raise ValueError("Need both deaths and recoveries to fit an age-CFR curve.")
 
-    fit = _spline_logistic_fit(work, age_col, "died", spline_df=spline_df, degree=degree, age_bounds=age_bounds)
+    fit, df_used = _fit_glm_with_model_selection(
+        work, age_col, "died", spline_df=spline_df, degree=degree, age_bounds=age_bounds
+    )
 
     if age_grid is None:
         lo, hi = age_bounds if age_bounds is not None else (work[age_col].min(), work[age_col].max())
         age_grid = np.linspace(lo, hi, n_grid)
 
     curve = _predict_cfr_curve(fit, age_grid, age_col=age_col, alpha=alpha)
-    return {"fit": fit, "curve": curve, "n": int(len(work)), "n_deaths": int(work["died"].sum())}
+    return {
+        "fit": fit,
+        "curve": curve,
+        "n": int(len(work)),
+        "n_deaths": int(work["died"].sum()),
+        "df_used": df_used,
+    }
 
 
 def relative_curves_by_age(
@@ -859,7 +980,7 @@ def relative_curves_by_age(
     CIs -- so the shared-parameter covariance between each grid age and the
     reference age is accounted for correctly.
     """
-    design_info = fit.model.data.design_info
+    design_info = _get_design_info(fit)
     age_grid = np.asarray(age_grid, dtype=float)
 
     ref_row = np.asarray(patsy.build_design_matrices([design_info], {age_col: [float(ref_age)]})[0])[0]
@@ -1117,6 +1238,18 @@ def _prepare_individual_time_data(
     work[event_col] = work[event_col].map(_safe_lower)
     work = work.dropna(subset=[start_col]).copy()
 
+    # Exclude impossible records: outcome before start (e.g. a missing onset
+    # date falling back to a later proxy -- lab confirmation, hospitalisation
+    # -- that turns out to postdate death; post-mortem confirmation is a
+    # real, known occurrence, not just bad data entry). Without this, a
+    # negative "time" silently reaches every downstream estimator that uses
+    # this function, and PHReg-based ones (group_hazard_ratio,
+    # cfr_competing_risks_by_age) reject it outright since Cox models
+    # require non-negative event times. Same convention already used by
+    # standardize_line_list.
+    valid_outcome = work[outcome_date_col].isna() | (work[outcome_date_col] >= work[start_col])
+    work = work.loc[valid_outcome].copy()
+
     if analysis_date is None:
         analysis_date = work[outcome_date_col].max()
         if pd.isna(analysis_date):
@@ -1372,19 +1505,11 @@ def cfr_competing_risk1(
 # ---------------------------------------------------------------------------
 
 
-_MAX_ABS_PHREG_COEF = 15.0  # exp(15) =~ 3.3M -- already far beyond any plausible HR;
-# anything past this is quasi-separation that stopped short of literally
-# diverging to inf/nan, not a real effect. See the Yambuku recovery model
-# that motivated this: 11 events on 4 spline params converged (finite
-# params/cov) to coefficients in the hundreds (HR ~ exp(400)), which passed
-# a finite-only check but produced nonsense hazard ratios and CIF artifacts.
-
-
 def _check_phreg_converged(result, status_col: str, n_events: int, spline_df: int, degree: int) -> None:
     params = np.asarray(result.params)
     cov = np.asarray(result.cov_params())
     max_abs_coef = float(np.max(np.abs(params))) if params.size else 0.0
-    if not np.all(np.isfinite(params)) or not np.all(np.isfinite(cov)) or max_abs_coef > _MAX_ABS_PHREG_COEF:
+    if not np.all(np.isfinite(params)) or not np.all(np.isfinite(cov)) or max_abs_coef > _MAX_ABS_LOG_LINEAR_COEF:
         raise ValueError(
             f"Cox model for '{status_col}' failed to converge stably (non-finite "
             f"parameters, or |coef| up to {max_abs_coef:.3g} indicating quasi-separation) "
@@ -1434,18 +1559,21 @@ def _fit_phreg_with_fallback(
     degree: int = 3,
     age_bounds: Optional[Tuple[float, float]] = None,
 ) -> Tuple[Any, int]:
-    """Try a cubic spline on age, backing off to fewer basis functions and
-    finally to a single linear age term, until one converges.
+    """Fit a cubic spline on age at several complexities (plus a plain
+    linear age term), and keep whichever converges cleanly with the lowest
+    AIC -- model selection among the candidates that fit properly, rather
+    than a fallback ladder that just stops at the first one that happens to
+    converge (that answers "what's the most flexible thing I could get away
+    with," not "what does the data actually support"). AIC here is
+    -2*llf + 2*n_params, the standard convention for comparing Cox models
+    via the partial likelihood (PHRegResults doesn't expose .aic directly,
+    unlike GLMResults, so it's computed by hand).
 
-    Rather than pre-guessing whether a given event count will support
-    spline_df parameters (see the docstring history of min_events in
-    age_time_relative_risk_curves -- that was a rough, empirically-tuned
-    guess, not a guarantee), this just tries fitting at decreasing
-    complexity and checks convergence directly (via _phreg_spline_fit's
-    finite-parameters check) each time. Returns (fit, df_used), where
-    df_used=1 signals the linear fallback (no spline). Raises ValueError,
-    with every attempt's failure reason, only if nothing converges.
+    Returns (fit, df_used); df_used=1 signals the linear candidate won.
+    Raises ValueError, with every attempt's failure reason, only if nothing
+    converges (including linear).
     """
+    candidates = []
     attempts = []
     for df_candidate in range(spline_df, degree - 1, -1):
         try:
@@ -1453,25 +1581,33 @@ def _fit_phreg_with_fallback(
                 data, age_col, time_col, status_col,
                 spline_df=df_candidate, degree=degree, age_bounds=age_bounds,
             )
-            return fit, df_candidate
+            aic = -2.0 * float(fit.llf) + 2.0 * len(fit.params)
+            candidates.append((fit, df_candidate, aic))
         except ValueError as exc:
             attempts.append(f"spline df={df_candidate}: {exc}")
 
-    # Last resort: a single linear age term (no spline at all).
+    # Always include a plain linear age term as a candidate too, not just a
+    # last resort -- it can legitimately win the AIC comparison even when a
+    # spline also converges, if the extra flexibility isn't earning its keep.
     try:
         model = sm.PHReg.from_formula(f"{time_col} ~ {age_col}", data=data, status=status_col, ties="efron")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             fit = model.fit()
         _check_phreg_converged(fit, status_col, int(data[status_col].sum()), spline_df=1, degree=1)
-        return fit, 1
+        aic = -2.0 * float(fit.llf) + 2.0 * len(fit.params)
+        candidates.append((fit, 1, aic))
     except ValueError as exc:
         attempts.append(f"linear: {exc}")
 
-    raise ValueError(
-        f"No age term converged for '{status_col}' at any complexity. Attempts:\n  "
-        + "\n  ".join(attempts)
-    )
+    if not candidates:
+        raise ValueError(
+            f"No age term converged for '{status_col}' at any complexity. Attempts:\n  "
+            + "\n  ".join(attempts)
+        )
+
+    best_fit, best_df, best_aic = min(candidates, key=lambda c: c[2])
+    return best_fit, best_df
 
 
 def hazard_ratio_curve_by_age(
@@ -1485,13 +1621,13 @@ def hazard_ratio_curve_by_age(
     """Cause-specific hazard ratio across age_grid, relative to ref_age.
 
     Same delta-method construction as age_cfr_odds_ratio / the OR piece of
-    relative_curves_by_age -- it's duck-typed against anything exposing
-    model.data.design_info / params / cov_params(), so it works unchanged
-    for a PHReg Cox fit here, not just the GLM logistic fits, since both are
-    log-linear in the covariates (only the meaning of "linear predictor"
-    differs: log-odds there, log-hazard here).
+    relative_curves_by_age -- it's duck-typed against anything exposing a
+    design-info-bearing model.data / params / cov_params(), so it works
+    unchanged for a PHReg Cox fit here, not just the GLM logistic fits,
+    since both are log-linear in the covariates (only the meaning of
+    "linear predictor" differs: log-odds there, log-hazard here).
     """
-    design_info = fit.model.data.design_info
+    design_info = _get_design_info(fit)
     age_grid = np.asarray(age_grid, dtype=float)
 
     ref_row = np.asarray(patsy.build_design_matrices([design_info], {age_col: [float(ref_age)]})[0])[0]
@@ -1554,8 +1690,8 @@ def cif_by_age_from_cause_specific_fits(
     survival -- this reduces to the same recursion as cfr_competing_risk1 in
     the small-hazard limit, but stays in [0, 1] regardless of scaling.
     """
-    design_death = fit_death.model.data.design_info
-    design_recovery = fit_recovery.model.data.design_info
+    design_death = _get_design_info(fit_death)
+    design_recovery = _get_design_info(fit_recovery)
     age_grid = np.asarray(age_grid, dtype=float)
 
     rows_death = np.asarray(patsy.build_design_matrices([design_death], {age_col: age_grid})[0])
@@ -1614,11 +1750,18 @@ def cfr_competing_risks_by_age(
     age_grid: Optional[np.ndarray] = None,
     n_grid: int = 100,
     ref_age: Optional[float] = None,
+    age_bounds: Optional[Tuple[float, float]] = None,
     alpha: float = 0.05,
     horizon: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Cause-specific hazards regression for death vs. recovery, with age
     entered via a B-spline -- the age-specific analogue of cfr_competing_risks.
+
+    Pass `age_bounds` (and `age_grid`, `ref_age`) to fix the spline domain
+    and reference age externally -- needed by the bootstrap CI below so
+    every resample shares the same domain/reference as the point estimate
+    (a with-replacement resample's own min/max age can only be a subset of
+    the original's, so this is always a valid domain for it).
 
     Fits two Cox models (death-cause and recovery-cause), each
     time ~ bs(age); an individual is censored (removed from the risk set)
@@ -1662,7 +1805,8 @@ def cfr_competing_risks_by_age(
             f"cause-specific hazard models (got {n_deaths} deaths, {n_recoveries} recoveries)."
         )
 
-    age_bounds = (float(work[age_col].min()), float(work[age_col].max()))
+    if age_bounds is None:
+        age_bounds = (float(work[age_col].min()), float(work[age_col].max()))
     if age_grid is None:
         age_grid = np.linspace(age_bounds[0], age_bounds[1], n_grid)
     if ref_age is None:
@@ -1690,6 +1834,366 @@ def cfr_competing_risks_by_age(
         "n_recoveries": n_recoveries,
         "death_df_used": death_df_used,
         "recovery_df_used": recovery_df_used,
+    }
+
+
+def cfr_competing_risks_by_age_ci(
+    df: pd.DataFrame,
+    *,
+    age_col: str = "age",
+    start_col: str = "start_date",
+    outcome_date_col: str = "outcome_date",
+    event_col: str = "event",
+    analysis_date: Optional[pd.Timestamp] = None,
+    death_label: str = "death",
+    recovery_label: str = "recovery",
+    spline_df: int = 4,
+    degree: int = 3,
+    age_grid: Optional[np.ndarray] = None,
+    n_grid: int = 100,
+    ref_age: Optional[float] = None,
+    alpha: float = 0.05,
+    horizon: Optional[float] = None,
+    n_boot: int = 200,
+    seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """cfr_competing_risks_by_age plus a bootstrap CI on the CIF curve.
+
+    The CIF there is a point estimate only -- an analytic CI would need the
+    delta method propagated through the whole product-integral recursion,
+    and that's a fragile thing to hand-derive here specifically because the
+    death and recovery models each independently fall back from a spline to
+    a plain linear term if they fail to converge (_fit_phreg_with_fallback),
+    so the parameter vector a gradient would be taken against doesn't even
+    have a fixed dimension across cases.
+
+    Case-resampling bootstrap sidesteps that entirely: each resample just
+    refits both cause-specific models and recomputes the CIF with the exact
+    same, already-validated cfr_competing_risks_by_age, whatever fallback
+    level it happens to land on. age_grid/age_bounds/ref_age/horizon are
+    all fixed to the point estimate's values so every resample's curve is
+    directly comparable at the same x-axis positions (a with-replacement
+    resample's own age range is always a subset of the original's, so this
+    domain is always valid for it -- same reasoning as the age-time
+    snapshots sharing one fixed domain).
+
+    Percentile bootstrap (the 2.5th/97.5th percentile of the resampled CIF
+    at each age, for the default alpha=0.05) -- the simplest, most standard
+    variant. Resamples where either cause-specific model fails to converge
+    even at the linear fallback are skipped and counted, not treated as an
+    error -- that's an expected outcome for a modest-sized outbreak, not a
+    bug, the same way individual snapshots get skipped in
+    age_time_relative_risk_curves.
+    """
+    point = cfr_competing_risks_by_age(
+        df,
+        age_col=age_col,
+        start_col=start_col,
+        outcome_date_col=outcome_date_col,
+        event_col=event_col,
+        analysis_date=analysis_date,
+        death_label=death_label,
+        recovery_label=recovery_label,
+        spline_df=spline_df,
+        degree=degree,
+        age_grid=age_grid,
+        n_grid=n_grid,
+        ref_age=ref_age,
+        alpha=alpha,
+        horizon=horizon,
+    )
+    age_grid_fixed = point["cif"]["age"].to_numpy()
+    age_bounds_fixed = (float(age_grid_fixed.min()), float(age_grid_fixed.max()))
+    ref_age_fixed = float(point["death_hazard_ratio"]["ref_age"].iloc[0])
+    horizon_fixed = point["cif"]["horizon"].iloc[0]
+
+    rng = np.random.default_rng(seed)
+    n = len(df)
+    boot_cifs = []
+    n_failed = 0
+    for _ in range(n_boot):
+        resample = df.iloc[rng.integers(0, n, size=n)]
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                res_b = cfr_competing_risks_by_age(
+                    resample,
+                    age_col=age_col,
+                    start_col=start_col,
+                    outcome_date_col=outcome_date_col,
+                    event_col=event_col,
+                    analysis_date=analysis_date,
+                    death_label=death_label,
+                    recovery_label=recovery_label,
+                    spline_df=spline_df,
+                    degree=degree,
+                    age_grid=age_grid_fixed,
+                    ref_age=ref_age_fixed,
+                    age_bounds=age_bounds_fixed,
+                    alpha=alpha,
+                    horizon=horizon_fixed,
+                )
+            boot_cifs.append(res_b["cif"]["cif_death"].to_numpy())
+        except ValueError:
+            n_failed += 1
+            continue
+
+    n_success = len(boot_cifs)
+    if n_success < max(10, n_boot // 4):
+        warnings.warn(
+            f"Only {n_success}/{n_boot} bootstrap replicates converged -- CI may be unreliable "
+            f"({n_failed} failed, typically from too few deaths/recoveries landing in a resample)."
+        )
+
+    cif_out = point["cif"].copy()
+    if n_success > 0:
+        boot_matrix = np.vstack(boot_cifs)
+        cif_out["cif_lower_ci"] = np.percentile(boot_matrix, 100 * alpha / 2, axis=0)
+        cif_out["cif_upper_ci"] = np.percentile(boot_matrix, 100 * (1 - alpha / 2), axis=0)
+    else:
+        cif_out["cif_lower_ci"] = np.nan
+        cif_out["cif_upper_ci"] = np.nan
+
+    point["cif"] = cif_out
+    point["n_boot"] = n_boot
+    point["n_boot_success"] = n_success
+    return point
+
+
+# ---------------------------------------------------------------------------
+# Binary-covariate group comparison (e.g. healthcare worker vs. not)
+#
+# A binary covariate has no continuum to model a shape over, unlike age --
+# splitting into groups and applying the existing pooled estimators to each
+# is the natural, lossless analysis (a regression on a single 0/1 covariate
+# reduces to exactly the group-specific estimates; it isn't an approximation
+# the way binning a continuous covariate would be). What group splitting
+# alone doesn't give you is a formal comparison between the groups with its
+# own CI -- group_death_ratio and group_hazard_ratio below add that.
+# ---------------------------------------------------------------------------
+
+
+def cfr_group_comparison(
+    df: pd.DataFrame,
+    *,
+    group_col: str = "is_hcw",
+    start_col: str = "start_date",
+    outcome_date_col: str = "outcome_date",
+    event_col: str = "event",
+    analysis_date: Optional[pd.Timestamp] = None,
+    death_label: str = "death",
+    recovery_label: str = "recovery",
+    family: str = "gamma",
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """Naive, resolved, competing-risks (Aalen-Johansen), adapted-KM (Ghani),
+    and parametric-mixture CFR, computed separately for each level of a
+    binary grouping column.
+
+    Delay-adjusted (Nishiura) is deliberately not included here -- it
+    operates on daily aggregate case/death arrays (a deconvolution over
+    calendar time), which doesn't have a natural per-group analogue the way
+    the other five individual-level estimators do.
+
+    Rows with a missing group_col value are dropped (e.g. "possible HCW" /
+    unknown occupation, which was left as NaN rather than guessed).
+    """
+    work = df.dropna(subset=[group_col]).copy()
+    groups = sorted(work[group_col].unique(), key=str)
+
+    rows = []
+    for g in groups:
+        sub = work.loc[work[group_col] == g]
+        time_event = _prepare_individual_time_data(
+            sub,
+            start_col=start_col,
+            outcome_date_col=outcome_date_col,
+            event_col=event_col,
+            analysis_date=analysis_date,
+            death_label=death_label,
+            recovery_label=recovery_label,
+        ).assign(time=lambda d: d["time"])
+
+        n = len(time_event)
+        n_deaths = int((time_event["event"] == death_label).sum())
+        n_recoveries = int((time_event["event"] == recovery_label).sum())
+
+        naive = cfr_naive(n_deaths, n)
+        resolved = (
+            cfr_resolved_cohort(n_deaths, n_recoveries)
+            if n_recoveries > 0
+            else {"estimate": np.nan, "lower_ci": np.nan, "upper_ci": np.nan}
+        )
+
+        try:
+            aj = cfr_competing_risks(time_event, time_col="time", event_col="event", alpha=alpha)
+        except Exception as exc:
+            aj = {"estimate": np.nan, "lower_ci": np.nan, "upper_ci": np.nan, "error": str(exc)}
+
+        try:
+            km = cfr_ghani_2005_km(time_event, time_col="time", event_col="event", alpha=alpha)
+        except Exception as exc:
+            km = {"estimate": np.nan, "lower_ci": np.nan, "upper_ci": np.nan, "error": str(exc)}
+
+        try:
+            mix = cfr_parametric_mixture(time_event, time_col="time", event_col="event", family=family, alpha=alpha)
+        except Exception as exc:
+            mix = {"estimate": np.nan, "lower_ci": np.nan, "upper_ci": np.nan, "error": str(exc)}
+
+        for method_name, res in [
+            ("naive", naive),
+            ("resolved", resolved),
+            ("competing_risks", aj),
+            ("kaplan_meier_ghani", km),
+            ("parametric_mixture", mix),
+        ]:
+            rows.append(
+                {
+                    "group": g,
+                    "method": method_name,
+                    "estimate": res.get("estimate", np.nan),
+                    "lower_ci": res.get("lower_ci", np.nan),
+                    "upper_ci": res.get("upper_ci", np.nan),
+                    "n": n,
+                    "n_deaths": n_deaths,
+                    "n_recoveries": n_recoveries,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def group_death_ratio(
+    df: pd.DataFrame,
+    *,
+    group_col: str = "is_hcw",
+    method: str = "naive",
+    start_col: str = "start_date",
+    outcome_date_col: str = "outcome_date",
+    event_col: str = "event",
+    analysis_date: Optional[pd.Timestamp] = None,
+    death_label: str = "death",
+    recovery_label: str = "recovery",
+    alpha: float = 0.05,
+) -> Dict[str, float]:
+    """OR and RR of death for group_col=True vs. False, with Wald CIs, via a
+    single-covariate logistic regression -- the formal-comparison analogue
+    of cfr_naive_by_age/cfr_resolved_by_age, but for a binary covariate
+    instead of a continuous spline (so no basis functions, no convergence
+    fallback needed -- one parameter is about as stable as a fit gets).
+
+    Reuses relative_curves_by_age's delta-method machinery directly (it's
+    generic in the covariate, not spline-specific) rather than re-deriving
+    the same OR/RR math a third time. For a single saturated binary
+    covariate this isn't an approximation: the model's predicted
+    probabilities equal the raw empirical group proportions exactly, so
+    reference_cfr/exposed_cfr below match what you'd get from cfr_naive on
+    each group directly.
+
+    Use RR (not OR) if you want reference_cfr * risk_ratio to reconstruct
+    the exposed group's CFR -- CFR is rarely a rare outcome, so OR does not
+    approximate RR here (see the ties/tie-breaking-style discussion earlier:
+    OR is always more extreme than RR away from the rare-outcome regime).
+
+    method="naive": every row counts towards the denominator (matches
+    cfr_naive's deaths/cases definition).
+    method="resolved": restricted to rows with a death/recovery outcome
+    (matches cfr_resolved_cohort's deaths/(deaths+recoveries) definition).
+    """
+    if method not in {"naive", "resolved"}:
+        raise ValueError("method must be 'naive' or 'resolved'")
+
+    time_event = _prepare_individual_time_data(
+        df,
+        start_col=start_col,
+        outcome_date_col=outcome_date_col,
+        event_col=event_col,
+        analysis_date=analysis_date,
+        death_label=death_label,
+        recovery_label=recovery_label,
+    )
+    work = time_event.join(df[[group_col]]).dropna(subset=[group_col])
+    if method == "resolved":
+        work = work.loc[work["event"].isin([death_label, recovery_label])]
+    work["died"] = (work["event"] == death_label).astype(int)
+    work["group"] = work[group_col].astype(bool).astype(int)
+
+    if work["died"].nunique() < 2 or work["group"].nunique() < 2:
+        raise ValueError("Need both outcomes and both groups represented to fit a death ratio.")
+
+    fit = smf.glm("died ~ group", data=work, family=sm.families.Binomial()).fit()
+    ratios = relative_curves_by_age(fit, age_grid=np.array([1.0]), ref_age=0.0, age_col="group", alpha=alpha).iloc[0]
+    reference_cfr = float(expit(fit.params["Intercept"]))
+
+    return {
+        "reference_cfr": reference_cfr,
+        "exposed_cfr": float(ratios["cfr"]),
+        "odds_ratio": float(ratios["odds_ratio"]),
+        "or_lower_ci": float(ratios["or_lower_ci"]),
+        "or_upper_ci": float(ratios["or_upper_ci"]),
+        "risk_ratio": float(ratios["risk_ratio"]),
+        "rr_lower_ci": float(ratios["rr_lower_ci"]),
+        "rr_upper_ci": float(ratios["rr_upper_ci"]),
+        "n": int(len(work)),
+    }
+
+
+def group_hazard_ratio(
+    df: pd.DataFrame,
+    *,
+    group_col: str = "is_hcw",
+    cause: str = "death",
+    start_col: str = "start_date",
+    outcome_date_col: str = "outcome_date",
+    event_col: str = "event",
+    analysis_date: Optional[pd.Timestamp] = None,
+    death_label: str = "death",
+    recovery_label: str = "recovery",
+    alpha: float = 0.05,
+) -> Dict[str, float]:
+    """Cause-specific hazard ratio for group_col=True vs. False, with a Wald
+    CI -- the group-comparison analogue of cfr_competing_risks_by_age, but
+    for a binary covariate. Same risk-set convention as cfr_competing_risks
+    (the other cause + administrative censoring remove someone from the
+    risk set), same ties="efron" fit.
+    """
+    if cause not in {"death", "recovery"}:
+        raise ValueError("cause must be 'death' or 'recovery'")
+
+    time_event = _prepare_individual_time_data(
+        df,
+        start_col=start_col,
+        outcome_date_col=outcome_date_col,
+        event_col=event_col,
+        analysis_date=analysis_date,
+        death_label=death_label,
+        recovery_label=recovery_label,
+    )
+    work = time_event.join(df[[group_col]]).dropna(subset=[group_col])
+    target_label = death_label if cause == "death" else recovery_label
+    work["status"] = (work["event"] == target_label).astype(int)
+    work["group"] = work[group_col].astype(bool).astype(int)
+
+    n_events = int(work["status"].sum())
+    if n_events < 2 or work["group"].nunique() < 2:
+        raise ValueError(f"Need at least 2 '{cause}' events and both groups represented to fit a hazard ratio.")
+
+    model = sm.PHReg.from_formula("time ~ group", data=work, status="status", ties="efron")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        fit = model.fit()
+    _check_phreg_converged(fit, f"status_{cause}", n_events, spline_df=1, degree=1)
+
+    coef = float(fit.params[0])
+    se = float(np.sqrt(np.asarray(fit.cov_params())[0, 0]))
+    z = norm.ppf(1 - alpha / 2)
+
+    return {
+        "hazard_ratio": float(np.exp(coef)),
+        "lower_ci": float(np.exp(coef - z * se)),
+        "upper_ci": float(np.exp(coef + z * se)),
+        "n": int(len(work)),
+        "n_events": n_events,
     }
 
 
@@ -1828,6 +2332,30 @@ def cfr_ghani_2005_km(
     S = np.asarray(S, dtype=float)
     h_dead = np.asarray(h_dead, dtype=float)
     h_rec = np.asarray(h_rec, dtype=float)
+
+    n_dead = int(np.sum(d_death))
+    n_recovered = int(np.sum(d_rec))
+    if n_dead == 0 or n_recovered == 0:
+        # theta0/(theta0+theta1) is mathematically well-defined here (not a
+        # 0/0 case) but trivially collapses to exactly 1.0 (or 0.0) whenever
+        # one outcome has never been observed -- the formula is built on
+        # Ghani et al.'s assumption that unresolved cases will eventually
+        # split death:recovery in the same ratio observed so far, and with
+        # zero of one outcome that assumption is completely untested, not
+        # just uncertain. Same convention as cfr_resolved_cohort's
+        # zero-denominator guard.
+        return {
+            "estimate": np.nan,
+            "lower_ci": np.nan,
+            "upper_ci": np.nan,
+            "se_cfr": np.nan,
+            "theta0": float(theta0),
+            "theta1": float(theta1),
+            "n_cases": int(len(times)),
+            "n_dead": n_dead,
+            "n_recovered": n_recovered,
+            "ci_method": "greenwood" if greenwood else "alt",
+        }
 
     denom = theta0 + theta1
     cfr = theta0 / denom if denom > 0 else np.nan
@@ -2134,14 +2662,21 @@ def cfr_parametric_mixture(
     times = np.maximum(times[valid], 1e-12)
     events = events[valid]
 
-    if np.sum(events == death_label) + np.sum(events == recovery_label) == 0:
+    n_dead = int(np.sum(events == death_label))
+    n_recovered = int(np.sum(events == recovery_label))
+    if n_dead == 0 or n_recovered == 0:
+        # Fitting two separate time-to-event sub-distributions (one per
+        # outcome) needs observations of both outcomes -- with zero of
+        # either, that sub-distribution is unidentifiable and the optimizer
+        # will just drift to a boundary solution (p -> 0 or 1) rather than
+        # failing loudly. Same convention as cfr_ghani_2005_km's guard.
         return {
             "estimate": np.nan,
             "lower_ci": np.nan,
             "upper_ci": np.nan,
             "family": family,
             "success": False,
-            "message": "No resolved outcomes available for mixture model.",
+            "message": f"Need both outcomes to fit the mixture model (got {n_dead} deaths, {n_recovered} recoveries).",
             "result": None,
         }
 
@@ -2938,6 +3473,10 @@ __all__ = [
     "cfr_delay_adjusted_nishiura",
     "cfr_competing_risks",
     "cfr_competing_risks_by_age",
+    "cfr_competing_risks_by_age_ci",
+    "cfr_group_comparison",
+    "group_death_ratio",
+    "group_hazard_ratio",
     "hazard_ratio_curve_by_age",
     "cif_by_age_from_cause_specific_fits",
     "cfr_ghani_2005_km",
@@ -3181,6 +3720,16 @@ def adapt_rosello_to_linelist(
     if "Age" in df.columns:
         work["age"] = _coerce_numeric(df["Age"])
 
+    if "Occupation" in df.columns:
+        occ = df["Occupation"].astype(str).str.strip()
+        # "possible HCW" is left as unknown (NaN) rather than guessed either
+        # way -- it's a small category (a handful of records per outbreak)
+        # and guessing wrong would bias whichever group it's forced into.
+        is_hcw = pd.Series(np.nan, index=df.index, dtype="object")
+        is_hcw[occ == "HCW"] = True
+        is_hcw[occ.isin(["no HCW", "Housewife", "Other", "Student", "Child"])] = False
+        work["is_hcw"] = is_hcw
+
     return work.dropna(subset=["start_date"]).copy()
 def adapt_rosello_to_linelist_by_outbreak(
     df: pd.DataFrame,
@@ -3290,6 +3839,11 @@ def adapt_uganda_to_linelist(
             "event": event,
         }
     )
+
+    if "Healthcare_worker" in df.columns:
+        # Field is "Y" or blank, no explicit "N" -- blank is treated as "not
+        # a healthcare worker" per user confirmation, not "unknown".
+        work["is_hcw"] = df["Healthcare_worker"].astype(str).str.strip().eq("Y")
 
     work = work.dropna(subset=["start_date"]).copy()
 
