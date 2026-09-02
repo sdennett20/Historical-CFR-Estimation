@@ -736,6 +736,29 @@ def _spline_logistic_fit(
     return result
 
 
+def _aicc(aic: float, k: int, n: int) -> float:
+    """Finite-sample-corrected AIC: AICc = AIC + 2k(k+1)/(n-k-1).
+
+    Malloy, Spiegelman & Eisen (2009, Computational Statistics & Data
+    Analysis 53(7):2605-2616) ran a dedicated simulation study on exactly
+    this problem -- choosing spline complexity in Cox models -- and found
+    plain AIC has a real, elevated false-positive rate for detecting
+    spurious nonlinearity, worst in smaller samples; they recommend AICc,
+    which selects fewer degrees of freedom than plain AIC while retaining
+    power to detect real nonlinearity. The correction term is largest when
+    n is small relative to k and vanishes as n grows, so it mainly changes
+    behavior exactly where plain AIC is known to misbehave.
+
+    Returns +inf (so this candidate can never win a min-AICc comparison)
+    when n-k-1<=0 -- too little data relative to the parameter count for
+    the correction to even be well-defined, let alone trustworthy.
+    """
+    denom = n - k - 1
+    if denom <= 0:
+        return float("inf")
+    return aic + (2.0 * k * (k + 1)) / denom
+
+
 def _fit_glm_with_model_selection(
     data: pd.DataFrame,
     age_col: str,
@@ -745,17 +768,37 @@ def _fit_glm_with_model_selection(
     degree: int = 3,
     age_bounds: Optional[Tuple[float, float]] = None,
 ) -> Tuple[Any, int]:
-    """Fit died ~ bs(age) at several spline complexities (plus a plain linear
-    age term), and keep whichever converges cleanly with the lowest AIC --
-    model selection among the candidates that fit properly, rather than a
-    fallback ladder that just stops at the first one that happens to
-    converge (that answers "what's the most flexible thing I could get away
-    with," not "what does the data actually support").
+    """Fit died ~ bs(age) at several complexities, and keep whichever
+    converges cleanly with the lowest AICc -- model selection among the
+    candidates that fit properly, rather than a fallback ladder that just
+    stops at the first one that happens to converge (that answers "what's
+    the most flexible thing I could get away with," not "what does the data
+    actually support"). Uses AICc (finite-sample-corrected AIC) rather than
+    plain AIC -- see _aicc's docstring for why: a dedicated study of this
+    exact problem (spline complexity selection in Cox/survival-style
+    regression) found plain AIC has an elevated false-positive rate for
+    detecting spurious nonlinearity, especially in smaller samples.
 
-    Returns (fit, df_used); df_used=1 signals the linear candidate won.
-    Raises ValueError, with every attempt's failure reason, only if nothing
-    converges (including linear).
+    Candidates: cubic splines (degree=3) from spline_df down to 3 basis
+    functions (i.e. down to 0 interior knots -- a single global cubic);
+    quadratic (degree=2, df=2, 0 interior knots -- a single global
+    parabola, capable of one bend but not an inflection); and linear
+    (degree=1, df=1, no bend at all). Quadratic matters as its own
+    candidate, not just a stepping stone: it's the cheapest curve that can
+    show a single dip-then-rise shape, and without it the search can only
+    choose between "no curvature" and "a whole cubic's worth of
+    flexibility" -- confirmed concretely on this project's own data, where
+    a outbreak's AIC-best model turned out to be quadratic once it was
+    actually offered, beating both the linear and cubic candidates that had
+    been the only options before.
+
+    Returns (fit, df_used) where df_used is the number of parameters used
+    (1=linear, 2=quadratic, 3=cubic/0 knots, 4=cubic/1 knot, ...) --
+    unambiguous here since every candidate in this fixed ladder has a
+    distinct parameter count. Raises ValueError, with every attempt's
+    failure reason, only if nothing converges (including linear).
     """
+    n_obs = int(len(data))
     candidates = []
     attempts = []
     for df_candidate in range(spline_df, degree - 1, -1):
@@ -763,9 +806,19 @@ def _fit_glm_with_model_selection(
             fit = _spline_logistic_fit(
                 data, age_col, died_col, spline_df=df_candidate, degree=degree, age_bounds=age_bounds
             )
-            candidates.append((fit, df_candidate, float(fit.aic)))
+            aicc = _aicc(float(fit.aic), len(fit.params), n_obs)
+            candidates.append((fit, df_candidate, aicc))
         except ValueError as exc:
             attempts.append(f"spline df={df_candidate}: {exc}")
+
+    # Quadratic (degree=2, df=2, 0 interior knots): the cheapest curve that
+    # can show a single bend, sitting between linear and the cubic family.
+    try:
+        fit = _spline_logistic_fit(data, age_col, died_col, spline_df=2, degree=2, age_bounds=age_bounds)
+        aicc = _aicc(float(fit.aic), len(fit.params), n_obs)
+        candidates.append((fit, 2, aicc))
+    except ValueError as exc:
+        attempts.append(f"quadratic df=2: {exc}")
 
     try:
         model = smf.glm(f"{died_col} ~ {age_col}", data=data, family=sm.families.Binomial())
@@ -773,7 +826,8 @@ def _fit_glm_with_model_selection(
             warnings.simplefilter("ignore", category=RuntimeWarning)
             fit = model.fit()
         _check_glm_converged(fit)
-        candidates.append((fit, 1, float(fit.aic)))
+        aicc = _aicc(float(fit.aic), len(fit.params), n_obs)
+        candidates.append((fit, 1, aicc))
     except ValueError as exc:
         attempts.append(f"linear: {exc}")
 
@@ -869,7 +923,12 @@ def cfr_naive_by_age(
     df: pd.DataFrame,
     *,
     age_col: str = "age",
+    start_col: str = "start_date",
+    outcome_date_col: str = "outcome_date",
     event_col: str = "event",
+    analysis_date: Optional[pd.Timestamp] = None,
+    death_label: str = "death",
+    recovery_label: str = "recovery",
     spline_df: int = 4,
     degree: int = 3,
     age_grid: Optional[np.ndarray] = None,
@@ -884,14 +943,34 @@ def cfr_naive_by_age(
     the deaths/cases definition, but death probability is modelled as
     died ~ bs(age) rather than pooled into a single ratio.
 
-    `df` must have a numeric age column and an `event` column with values
-    "death" / "recovery" / "censored" (as produced by standardize_line_list).
-    Pass `age_bounds` to fix the spline's domain (e.g. to the full dataset's
-    age range) when comparing several fits on different subsets -- see
-    age_time_relative_risk_curves.
+    An individual only counts as a death/recovery if they have a valid,
+    in-window outcome_date on record -- a labeled outcome with no date is
+    treated as censored, via _prepare_individual_time_data, the same
+    convention enforced everywhere else in this file (cfr_competing_risks,
+    cfr_ghani_2005_km, cfr_parametric_mixture, cfr_competing_risks_by_age,
+    group_death_ratio, ...). This used to just trust the raw event label
+    regardless of a missing date, which let this function's results
+    silently disagree with the rest of the file whenever outcome-date
+    completeness wasn't 100% -- caught via Kikwit, which has 20 individuals
+    with a death/recovery label but no recorded date; including vs.
+    excluding them changed which spline complexity AIC selected.
+
+    `df` must have a numeric age column and start_date/outcome_date/event
+    columns (as produced by standardize_line_list). Pass `age_bounds` to fix
+    the spline's domain when comparing several fits on different subsets --
+    see age_time_relative_risk_curves.
     """
-    work = df.dropna(subset=[age_col]).copy()
-    work["died"] = (work[event_col] == "death").astype(int)
+    time_event = _prepare_individual_time_data(
+        df,
+        start_col=start_col,
+        outcome_date_col=outcome_date_col,
+        event_col=event_col,
+        analysis_date=analysis_date,
+        death_label=death_label,
+        recovery_label=recovery_label,
+    )
+    work = time_event.join(df[[age_col]]).dropna(subset=[age_col])
+    work["died"] = (work["event"] == death_label).astype(int)
 
     if work["died"].nunique() < 2:
         raise ValueError("Need both deaths and non-deaths to fit an age-CFR curve.")
@@ -918,7 +997,12 @@ def cfr_resolved_by_age(
     df: pd.DataFrame,
     *,
     age_col: str = "age",
+    start_col: str = "start_date",
+    outcome_date_col: str = "outcome_date",
     event_col: str = "event",
+    analysis_date: Optional[pd.Timestamp] = None,
+    death_label: str = "death",
+    recovery_label: str = "recovery",
     spline_df: int = 4,
     degree: int = 3,
     age_grid: Optional[np.ndarray] = None,
@@ -933,15 +1017,27 @@ def cfr_resolved_by_age(
     estimator's conditioning on resolution, with death probability modelled
     as died ~ bs(age) rather than pooled into a single ratio.
 
-    `df` must have a numeric age column and an `event` column with values
-    "death" / "recovery" / "censored" (as produced by standardize_line_list).
-    Pass `age_bounds` to fix the spline's domain (e.g. to the full dataset's
-    age range) when comparing several fits on different subsets -- see
-    age_time_relative_risk_curves.
+    Same date-validated event convention as cfr_naive_by_age (see its
+    docstring) -- a labeled outcome with no recorded date doesn't count as
+    resolved here, via _prepare_individual_time_data.
+
+    `df` must have a numeric age column and start_date/outcome_date/event
+    columns (as produced by standardize_line_list). Pass `age_bounds` to fix
+    the spline's domain when comparing several fits on different subsets --
+    see age_time_relative_risk_curves.
     """
-    work = df.dropna(subset=[age_col]).copy()
-    work = work.loc[work[event_col].isin(["death", "recovery"])].copy()
-    work["died"] = (work[event_col] == "death").astype(int)
+    time_event = _prepare_individual_time_data(
+        df,
+        start_col=start_col,
+        outcome_date_col=outcome_date_col,
+        event_col=event_col,
+        analysis_date=analysis_date,
+        death_label=death_label,
+        recovery_label=recovery_label,
+    )
+    work = time_event.join(df[[age_col]]).dropna(subset=[age_col])
+    work = work.loc[work["event"].isin([death_label, recovery_label])].copy()
+    work["died"] = (work["event"] == death_label).astype(int)
 
     if work["died"].nunique() < 2:
         raise ValueError("Need both deaths and recoveries to fit an age-CFR curve.")
@@ -1561,18 +1657,38 @@ def _fit_phreg_with_fallback(
 ) -> Tuple[Any, int]:
     """Fit a cubic spline on age at several complexities (plus a plain
     linear age term), and keep whichever converges cleanly with the lowest
-    AIC -- model selection among the candidates that fit properly, rather
+    AICc -- model selection among the candidates that fit properly, rather
     than a fallback ladder that just stops at the first one that happens to
     converge (that answers "what's the most flexible thing I could get away
     with," not "what does the data actually support"). AIC here is
     -2*llf + 2*n_params, the standard convention for comparing Cox models
     via the partial likelihood (PHRegResults doesn't expose .aic directly,
-    unlike GLMResults, so it's computed by hand).
+    unlike GLMResults, so it's computed by hand), then finite-sample
+    corrected to AICc via _aicc (see its docstring: a dedicated study of
+    spline complexity selection in Cox models found plain AIC has an
+    elevated false-positive rate for spurious nonlinearity, especially in
+    smaller samples -- exactly the regime several of these outbreaks are
+    in). The correction uses the number of events for this cause as "n",
+    not the total row count -- a partial likelihood's information content
+    scales with events, not the size of the risk set, the same reasoning
+    behind the events-per-parameter heuristics used elsewhere in this file.
 
-    Returns (fit, df_used); df_used=1 signals the linear candidate won.
-    Raises ValueError, with every attempt's failure reason, only if nothing
-    converges (including linear).
+    Quadratic (degree=2, df=2, 0 interior knots -- a single global
+    parabola) is also included as its own candidate, not just a stepping
+    stone between linear and cubic: it's the cheapest curve that can show
+    a single dip-then-rise shape, and without it the search can only choose
+    between "no curvature" and "a whole cubic's worth of flexibility" --
+    confirmed concretely on this project's own data, where an outbreak's
+    AIC-best naive-CFR model turned out to be quadratic once it was
+    actually offered as an option.
+
+    Returns (fit, df_used) where df_used is the number of parameters used
+    (1=linear, 2=quadratic, 3=cubic/0 knots, 4=cubic/1 knot, ...) --
+    unambiguous here since every candidate in this fixed ladder has a
+    distinct parameter count. Raises ValueError, with every attempt's
+    failure reason, only if nothing converges (including linear).
     """
+    n_events = int(data[status_col].sum())
     candidates = []
     attempts = []
     for df_candidate in range(spline_df, degree - 1, -1):
@@ -1582,21 +1698,28 @@ def _fit_phreg_with_fallback(
                 spline_df=df_candidate, degree=degree, age_bounds=age_bounds,
             )
             aic = -2.0 * float(fit.llf) + 2.0 * len(fit.params)
-            candidates.append((fit, df_candidate, aic))
+            candidates.append((fit, df_candidate, _aicc(aic, len(fit.params), n_events)))
         except ValueError as exc:
             attempts.append(f"spline df={df_candidate}: {exc}")
 
+    try:
+        fit = _phreg_spline_fit(data, age_col, time_col, status_col, spline_df=2, degree=2, age_bounds=age_bounds)
+        aic = -2.0 * float(fit.llf) + 2.0 * len(fit.params)
+        candidates.append((fit, 2, _aicc(aic, len(fit.params), n_events)))
+    except ValueError as exc:
+        attempts.append(f"quadratic df=2: {exc}")
+
     # Always include a plain linear age term as a candidate too, not just a
-    # last resort -- it can legitimately win the AIC comparison even when a
+    # last resort -- it can legitimately win the AICc comparison even when a
     # spline also converges, if the extra flexibility isn't earning its keep.
     try:
         model = sm.PHReg.from_formula(f"{time_col} ~ {age_col}", data=data, status=status_col, ties="efron")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             fit = model.fit()
-        _check_phreg_converged(fit, status_col, int(data[status_col].sum()), spline_df=1, degree=1)
+        _check_phreg_converged(fit, status_col, n_events, spline_df=1, degree=1)
         aic = -2.0 * float(fit.llf) + 2.0 * len(fit.params)
-        candidates.append((fit, 1, aic))
+        candidates.append((fit, 1, _aicc(aic, len(fit.params), n_events)))
     except ValueError as exc:
         attempts.append(f"linear: {exc}")
 
