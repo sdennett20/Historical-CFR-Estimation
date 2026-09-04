@@ -1,0 +1,13 @@
+group,method,estimate,lower_ci,upper_ci,n,n_deaths,n_recoveries,outbreak_year
+False,naive,0.6764705882352942,0.4947346991014954,0.8261165725060786,34,23,0,2014
+False,resolved,,,,34,23,0,2014
+False,delay_adjusted,0.6765,0.5105000000000001,0.8167000000000001,34,23,0,2014
+False,competing_risks,,,,34,23,0,2014
+False,kaplan_meier_ghani,,,,34,23,0,2014
+False,parametric_mixture,,,,34,23,0,2014
+True,naive,0.6333333333333333,0.43855984901195755,0.8007013749879655,30,19,0,2014
+True,resolved,,,,30,19,0,2014
+True,delay_adjusted,0.6786,0.4954,0.8304,30,19,0,2014
+True,competing_risks,,,,30,19,0,2014
+True,kaplan_meier_ghani,,,,30,19,0,2014
+True,parametric_mixture,,,,30,19,0,2014
